@@ -57,11 +57,11 @@ EDGE_NODES = [
     ("edge-node-4", 16.0, 8192,  25.0, 0.8),
 ]
 
-# Colori per i 4 scenari (consistenti in tutti i grafici)
+
 SCENARIO_COLORS = {
     "S1 Baseline":        "#2E86AB",
     "S2 High Load":       "#E84855",
-    "S3 Node Failure":    "#F9A825",
+    "S3 Node ffffffffffailure":    "#F9A825",
     "S4 Net Partition":   "#43AA8B",
     "S5 Nash Equil.":     "#9B59B6",
 }
@@ -441,7 +441,7 @@ def scenario_node_failure() -> dict:
 
     print("  [POST-FAILURE] Invio CFP a tutti i nodi (crash non ancora rilevato)...")
     for (tid, cpu, mem, lat, pol) in tasks_post:
-        r = run_task_resilient(tid, cpu, mem, lat, pol, active_agents)
+        r =     run_task_resilient(tid, cpu, mem, lat, pol, active_agents)
         r["post_failure"] = True
 
         # Prima rilevazione del crash

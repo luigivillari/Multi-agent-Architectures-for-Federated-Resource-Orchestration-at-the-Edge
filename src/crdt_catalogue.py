@@ -97,7 +97,7 @@ class NodeSnapshot:
     is_online:        LWWRegister = field(default=None)  # True/False
 
     def __post_init__(self):
-        """Inizializza i LWW-Register con valori di default se non forniti."""
+        """Inizializza i LWW-Register con valori di default se sono stati non forniti."""
         ts = 0
         if self.cpu_available is None:
             self.cpu_available = LWWRegister(0.0, ts, self.node_id)

@@ -3,8 +3,7 @@ protocol.py
 ===========
 Fase 2 — A2A Protocol: Grammatica dei Messaggi di Negoziazione
 
-Definisce tutti i tipi di messaggio scambiati tra ResourceAgent e TaskAgent,
-ispirato alle specifiche Google A2A (2025) adattato al dominio resource-oriented.
+Definisce tutti i tipi di messaggio scambiati tra ResourceAgent e TaskAgent.
 
 Flusso di negoziazione:
     TaskAgent  --[CFP]-->          ResourceAgent  (broadcast)
@@ -82,9 +81,6 @@ class A2AMessage:
     Struttura base di un messaggio A2A.
     Ogni scambio tra agenti è un'istanza di questa classe.
 
-    Ispirato a:
-    - Google A2A spec v0.3 (JSON-RPC 2.0 over HTTP)
-    - Contract Net Protocol (Smith, 1980)
     """
     msg_type:     MessageType
     sender_id:    str                      # ID dell'agente mittente
@@ -93,7 +89,7 @@ class A2AMessage:
     timestamp:    float = field(default_factory=time.time)
     msg_id:       str   = field(default_factory=lambda: str(uuid.uuid4())[:8])
 
-    # Payload opzionale — dipende dal tipo di messaggio
+    # Payload opzionale 
     task_id:      Optional[str] = None
     requirements: Optional[TaskRequirements] = None
     offer:        Optional[ResourceOffer] = None
@@ -126,7 +122,7 @@ class A2AMessage:
 
 
 # ─────────────────────────────────────────────
-# Factory Methods — costruzione messaggi
+#  costruzione messaggi
 # ─────────────────────────────────────────────
 
 def make_cfp(sender_id: str, task_id: str, requirements: TaskRequirements,
@@ -201,7 +197,7 @@ def make_inform_done(sender_id: str, receiver_id: str,
 
 
 # ─────────────────────────────────────────────
-# Policy di scoring — usate dai Task Agent
+# Policy di scoring 
 # ─────────────────────────────────────────────
 
 class PlacementPolicy(str, Enum):

@@ -28,7 +28,7 @@ from crdt_catalogue import ResourceCatalogue
 
 
 # ─────────────────────────────────────────────
-# Configurazione Nodi Edge (simulati)
+# Configurazione Nodi Edge 
 # ─────────────────────────────────────────────
 
 EDGE_NODES = [
@@ -69,7 +69,6 @@ def print_section(title: str):
 def simulate_crdt_gossip(resource_agents: List[ray.actor.ActorHandle]):
     """
     Simula un round di gossip CRDT tra tutti i nodi.
-    In produzione questo avverrebbe automaticamente in background.
     """
     print("\n[CRDT Gossip] Sincronizzazione catalogo tra tutti i nodi...")
     catalogues = [ray.get(a.get_catalogue_object.remote()) for a in resource_agents]
@@ -80,7 +79,7 @@ def simulate_crdt_gossip(resource_agents: List[ray.actor.ActorHandle]):
             if i != j:
                 agent.sync_catalogue.remote(other_catalogue)
 
-    time.sleep(0.1)  # piccolo delay per propagazione asincrona
+    time.sleep(0.1)  
     print("[CRDT Gossip] Round completato.")
 
 
