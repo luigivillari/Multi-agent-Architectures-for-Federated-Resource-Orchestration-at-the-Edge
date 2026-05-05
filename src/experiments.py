@@ -47,7 +47,7 @@ from crdt_catalogue import ResourceCatalogue
 # Configurazione globale
 # ─────────────────────────────────────────────
 
-RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results")
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results_CI")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 EDGE_NODES = [
@@ -57,34 +57,62 @@ EDGE_NODES = [
     ("edge-node-4", 16.0, 8192,  25.0, 0.8),
 ]
 
-
+# Colori per i 4 scenari (consistenti in tutti i grafici)
 SCENARIO_COLORS = {
     "S1 Baseline":        "#2E86AB",
     "S2 High Load":       "#E84855",
-    "S3 Node ffffffffffailure":    "#F9A825",
+    "S3 Node Failure":    "#F9A825",
     "S4 Net Partition":   "#43AA8B",
     "S5 Nash Equil.":     "#9B59B6",
 }
 
 SCENARIOS = list(SCENARIO_COLORS.keys())
 
+# ─────────────────────────────────────────────
+# Numero di run indipendenti per scenario
+# Aumentare per intervalli di confidenza più stretti.
+# Con N=30 il CI si dimezza rispetto a N=5.
+# ─────────────────────────────────────────────
+N_RUNS = 30
+
 
 # ─────────────────────────────────────────────
-# Helpers
+# Registry globale degli actor Ray attivi
+# Ogni actor creato viene registrato qui e
+# viene distrutto esplicitamente dopo ogni run
+# per evitare memory leak su esperimenti lunghi.
 # ─────────────────────────────────────────────
+_actor_registry: list = []
+
 
 def make_resource_agents():
-    """Crea e registra 4 ResourceAgent freschi."""
+    """Crea 4 ResourceAgent freschi e li registra nel registry globale."""
     agents = []
     for (node_id, cpu, mem, lat, energy) in EDGE_NODES:
         a = ResourceAgent.remote(node_id, cpu, mem, lat, energy)
         agents.append(a)
+        _actor_registry.append(a)
     time.sleep(0.3)
     for i, agent in enumerate(agents):
         peers = [a for j, a in enumerate(agents) if j != i]
         agent.register_peers.remote(peers)
     time.sleep(0.1)
     return agents
+
+
+def kill_registered_actors():
+    """
+    Distrugge tutti gli actor Ray registrati e svuota il registry.
+    Da chiamare alla fine di ogni run per liberare memoria.
+    """
+    for actor in _actor_registry:
+        try:
+            ray.kill(actor, no_restart=True)
+        except Exception:
+            pass   # già morto (es. S3 node failure)
+    _actor_registry.clear()
+    # Piccola pausa per dare a Ray il tempo di liberare le risorse
+    time.sleep(0.2)
 
 
 def run_task(task_id: str, cpu: float, mem: float, max_lat: float,
@@ -221,29 +249,144 @@ def compute_metrics(task_results: list) -> dict:
 
 
 # ─────────────────────────────────────────────
+# Multi-run: raccolta campioni e CI al 95%
+# ─────────────────────────────────────────────
+
+def ci_95(values: list) -> float:
+    """
+    Intervallo di confidenza al 95% per la media campionaria.
+    Usa la distribuzione t di Student (corretta per piccoli campioni).
+    Formula: CI = t_(0.975, df=n-1) * std(values) / sqrt(n)
+    """
+    n = len(values)
+    if n < 2:
+        return 0.0
+    s = np.std(values, ddof=1)      # deviazione standard campionaria
+    # Approssimazione t per quantile 0.975: valori dalla tavola t
+    # n=5→2.776  n=10→2.262  n=15→2.145  n=20→2.093  n=30→2.045  n≥120→1.980
+    t_table = {5: 2.776, 10: 2.262, 15: 2.145, 20: 2.093, 25: 2.064,
+               30: 2.045, 40: 2.021, 60: 2.000, 120: 1.980}
+    # Trova il t più conservativo (primo valore >= n)
+    t_val = 1.96
+    for df_key in sorted(t_table.keys()):
+        if n <= df_key:
+            t_val = t_table[df_key]
+            break
+    return float(t_val * s / np.sqrt(n))
+
+
+def run_scenario_n_times(scenario_fn, scenario_name: str,
+                         n_runs: int = N_RUNS) -> dict:
+    """
+    Esegue lo stesso scenario n_runs volte come run indipendenti.
+    Per ogni run raccoglie le 4 metriche scalari aggregate.
+    Alla fine calcola media e CI al 95% su quei campioni.
+
+    Perché questo riduce il CI:
+        CI = t * std / sqrt(n_runs)
+    Raddoppiare n_runs dimezza l'errore standard.
+
+    Ritorna un dict compatibile con i plot esistenti, con in più:
+        - *_ci   : intervallo di confidenza al 95%
+        - *_runs : lista dei valori per run (per scatter plot)
+    """
+    lat_runs   = []
+    a2a_runs   = []
+    sla_runs   = []
+    crdt_runs  = []
+
+    print(f"\n  ── Esecuzione {n_runs} run indipendenti per {scenario_name} ──")
+    last_run = None
+    for run_idx in range(1, n_runs + 1):
+        try:
+            m = scenario_fn()
+            lat_runs.append(m["placement_latency_ms"])
+            a2a_runs.append(m["a2a_overhead_ms"])
+            sla_runs.append(m["sla_violation_rate"])
+            crdt_runs.append(m["crdt_convergence_ms"])
+            last_run = m   # teniamo l'ultima run valida per le metriche extra
+            print(f"    run {run_idx:2d}/{n_runs}: "
+                  f"lat={m['placement_latency_ms']:.1f}ms  "
+                  f"a2a={m['a2a_overhead_ms']:.1f}ms  "
+                  f"sla={m['sla_violation_rate']*100:.0f}%  "
+                  f"crdt={m['crdt_convergence_ms']:.0f}ms")
+        except Exception as e:
+            print(f"    run {run_idx:2d}/{n_runs}: ERRORE — {e} (run scartata)")
+        finally:
+            # ── CLEANUP CRITICO ───────────────────────────────────────────────
+            # Distrugge tutti gli actor Ray creati in questa run (ResourceAgent,
+            # NashTaskAgent, ecc.). Senza questo, ogni run accumula ~4-16 processi
+            # Python in RAM fino a OOM. Chiamato sempre, anche in caso di errore.
+            kill_registered_actors()
+
+    if last_run is None:
+        raise RuntimeError(f"Tutte le run di {scenario_name} sono fallite.")
+
+    result = dict(last_run)   # eredita le chiavi "extra" dall'ultima run valida
+
+    # Sovrascrive le 4 metriche principali con la media delle N run
+    result["placement_latency_ms"]  = float(np.mean(lat_runs))
+    result["placement_latency_std"] = float(np.std(lat_runs, ddof=1))
+    result["placement_latency_ci"]  = ci_95(lat_runs)
+    result["placement_latency_runs"] = lat_runs
+
+    result["a2a_overhead_ms"]  = float(np.mean(a2a_runs))
+    result["a2a_overhead_std"] = float(np.std(a2a_runs, ddof=1))
+    result["a2a_overhead_ci"]  = ci_95(a2a_runs)
+    result["a2a_overhead_runs"] = a2a_runs
+
+    result["sla_violation_rate"]     = float(np.mean(sla_runs))
+    result["sla_violation_rate_std"] = float(np.std(sla_runs, ddof=1))
+    result["sla_violation_rate_ci"]  = ci_95(sla_runs)
+    result["sla_violation_rate_runs"] = sla_runs
+
+    result["crdt_convergence_ms"]     = float(np.mean(crdt_runs))
+    result["crdt_convergence_ms_std"] = float(np.std(crdt_runs, ddof=1))
+    result["crdt_convergence_ms_ci"]  = ci_95(crdt_runs)
+    result["crdt_convergence_ms_runs"] = crdt_runs
+
+    result["n_runs"] = len(lat_runs)   # run effettive (escluse quelle con errore)
+
+    print(f"  ── {scenario_name}: {len(lat_runs)} run valide ──")
+    print(f"     Placement latency : {result['placement_latency_ms']:.2f} ± "
+          f"{result['placement_latency_ci']:.2f} ms  (95% CI)")
+    print(f"     A2A overhead      : {result['a2a_overhead_ms']:.2f} ± "
+          f"{result['a2a_overhead_ci']:.2f} ms  (95% CI)")
+    print(f"     SLA violation rate: {result['sla_violation_rate']*100:.1f} ± "
+          f"{result['sla_violation_rate_ci']*100:.1f}%  (95% CI)")
+    print(f"     CRDT convergence  : {result['crdt_convergence_ms']:.1f} ± "
+          f"{result['crdt_convergence_ms_ci']:.1f} ms  (95% CI)")
+    return result
+
+
+# ─────────────────────────────────────────────
 # Scenario 1 — Baseline
 # ─────────────────────────────────────────────
 
 def scenario_baseline() -> dict:
     """
-    Carico normale: 10 task con requisiti misti, rete stabile.
-    Serve come riferimento per confrontare gli altri scenari.
+    Carico normale: 10 task con requisiti randomizzati per scenario,
+    campionati da distribuzioni realistiche. La randomizzazione garantisce
+    che ogni run sia un esperimento genuinamente diverso, necessario per
+    ottenere intervalli di confidenza statisticamente validi.
+
+    Ranges scelti per rappresentare un workload edge realistico:
+      cpu  : U[0.5, 4.0] core
+      mem  : cpu * U[128, 512] MB
+      lat  : U[20, 500] ms  — da real-time a best-effort
+      policy: campionata uniformemente
     """
     print("\n[S1] Baseline — carico normale, rete stabile")
     agents = make_resource_agents()
 
-    tasks = [
-        ("t01", 1.0,  256,  50.0, PlacementPolicy.LATENCY_FIRST),
-        ("t02", 2.0,  512, 100.0, PlacementPolicy.ENERGY_FIRST),
-        ("t03", 0.5,  128, 200.0, PlacementPolicy.BALANCED),
-        ("t04", 4.0, 1024,  30.0, PlacementPolicy.LATENCY_FIRST),
-        ("t05", 1.0,  256, 500.0, PlacementPolicy.ENERGY_FIRST),
-        ("t06", 2.0,  512,  60.0, PlacementPolicy.BALANCED),
-        ("t07", 1.0,  256, 150.0, PlacementPolicy.BALANCED),
-        ("t08", 0.5,  128,  20.0, PlacementPolicy.LATENCY_FIRST),
-        ("t09", 2.0,  512, 200.0, PlacementPolicy.ENERGY_FIRST),
-        ("t10", 1.0,  256, 100.0, PlacementPolicy.BALANCED),
-    ]
+    policies = list(PlacementPolicy)
+    tasks = []
+    for i in range(10):
+        cpu = round(random.choice([0.5, 1.0, 2.0, 4.0]), 1)
+        mem = cpu * random.choice([128, 256, 512])
+        lat = round(random.uniform(20.0, 500.0), 1)
+        pol = random.choice(policies)
+        tasks.append((f"t{i+1:02d}", cpu, mem, lat, pol))
 
     results = []
     for (tid, cpu, mem, lat, pol) in tasks:
@@ -403,13 +546,15 @@ def scenario_node_failure() -> dict:
     agent_id_map = {a: ray.get(a.get_state.remote())["node_id"] for a in agents}
 
     # ── Prima metà: tutti e 4 i nodi disponibili ──────────────────
-    tasks_pre = [
-        ("f01", 1.0,  256,  50.0, PlacementPolicy.LATENCY_FIRST),
-        ("f02", 2.0,  512, 100.0, PlacementPolicy.BALANCED),
-        ("f03", 4.0, 1024,  30.0, PlacementPolicy.LATENCY_FIRST),
-        ("f04", 1.0,  256, 200.0, PlacementPolicy.ENERGY_FIRST),
-        ("f05", 0.5,  128,  20.0, PlacementPolicy.LATENCY_FIRST),
-    ]
+    # Task randomizzati: ogni run simula un workload diverso pre-failure
+    policies = list(PlacementPolicy)
+    tasks_pre = []
+    for i in range(5):
+        cpu = random.choice([0.5, 1.0, 2.0, 4.0])
+        mem = cpu * random.choice([128, 256, 512])
+        lat = round(random.uniform(20.0, 300.0), 1)
+        pol = random.choice(policies)
+        tasks_pre.append((f"f{i+1:02d}", cpu, mem, lat, pol))
 
     results = []
     print("  [PRE-FAILURE] Tutti i nodi attivi:")
@@ -431,17 +576,18 @@ def scenario_node_failure() -> dict:
     crash_detected = False
     t_detect = None
 
-    tasks_post = [
-        ("f06", 1.0,  256,  50.0, PlacementPolicy.LATENCY_FIRST),
-        ("f07", 2.0,  512, 100.0, PlacementPolicy.BALANCED),
-        ("f08", 4.0, 1024,  30.0, PlacementPolicy.LATENCY_FIRST),
-        ("f09", 1.0,  256, 200.0, PlacementPolicy.ENERGY_FIRST),
-        ("f10", 0.5,  128,  20.0, PlacementPolicy.LATENCY_FIRST),
-    ]
+    # Task post-failure randomizzati: misura resilienza sotto carichi diversi
+    tasks_post = []
+    for i in range(5):
+        cpu = random.choice([0.5, 1.0, 2.0, 4.0])
+        mem = cpu * random.choice([128, 256, 512])
+        lat = round(random.uniform(20.0, 300.0), 1)
+        pol = random.choice(list(PlacementPolicy))
+        tasks_post.append((f"f{i+6:02d}", cpu, mem, lat, pol))
 
     print("  [POST-FAILURE] Invio CFP a tutti i nodi (crash non ancora rilevato)...")
     for (tid, cpu, mem, lat, pol) in tasks_post:
-        r =     run_task_resilient(tid, cpu, mem, lat, pol, active_agents)
+        r = run_task_resilient(tid, cpu, mem, lat, pol, active_agents)
         r["post_failure"] = True
 
         # Prima rilevazione del crash
@@ -503,17 +649,24 @@ def scenario_network_partition() -> dict:
     island_a = agents[:2]   # edge-node-1, edge-node-2
     island_b = agents[2:]   # edge-node-3, edge-node-4
 
-    # ── Fase partizione: task su isole separate ──────────────
-    tasks_a = [
-        ("pa01", 1.0, 256,  50.0, PlacementPolicy.LATENCY_FIRST),
-        ("pa02", 2.0, 512, 100.0, PlacementPolicy.BALANCED),
-        ("pa03", 1.0, 256, 200.0, PlacementPolicy.ENERGY_FIRST),
-    ]
-    tasks_b = [
-        ("pb01", 1.0, 256,  80.0, PlacementPolicy.LATENCY_FIRST),
-        ("pb02", 2.0, 512, 150.0, PlacementPolicy.BALANCED),
-        ("pb03", 0.5, 128, 500.0, PlacementPolicy.ENERGY_FIRST),
-    ]
+    # ── Fase partizione: task su isole separate (randomizzati per run) ──
+    # I nodi delle isole A e B hanno latenze diverse (node-1=15ms, node-2=40ms,
+    # node-3=80ms, node-4=25ms), quindi il workload cambiante produce
+    # variabilità reale nelle SLA violations e nella divergenza CRDT.
+    policies = list(PlacementPolicy)
+    tasks_a = []
+    for i in range(3):
+        cpu = random.choice([0.5, 1.0, 2.0])
+        mem = cpu * random.choice([128, 256, 512])
+        lat = round(random.uniform(30.0, 300.0), 1)
+        tasks_a.append((f"pa{i+1:02d}", cpu, mem, lat, random.choice(policies)))
+
+    tasks_b = []
+    for i in range(3):
+        cpu = random.choice([0.5, 1.0, 2.0])
+        mem = cpu * random.choice([128, 256, 512])
+        lat = round(random.uniform(60.0, 500.0), 1)  # isola B ha nodi più lenti
+        tasks_b.append((f"pb{i+1:02d}", cpu, mem, lat, random.choice(policies)))
 
     print("  [PARTIZIONE ATTIVA]")
     print("  Isola A (node-1, node-2):")
@@ -552,12 +705,14 @@ def scenario_network_partition() -> dict:
     print(f"  Divergenza CRDT dopo gossip: {diffs_after} entry divergenti "
           f"({'CONVERGED' if diffs_after == 0 else 'STILL DIVERGING'})")
 
-    # ── Task post-riconnessione (cluster completo) ─────────────
+    # ── Task post-riconnessione (cluster completo, randomizzati) ──────────
     print("  [POST-RICONNESSIONE] Cluster completo:")
-    tasks_post = [
-        ("pc01", 1.0, 256,  50.0, PlacementPolicy.LATENCY_FIRST),
-        ("pc02", 2.0, 512, 100.0, PlacementPolicy.BALANCED),
-    ]
+    tasks_post = []
+    for i in range(2):
+        cpu = random.choice([0.5, 1.0, 2.0])
+        mem = cpu * random.choice([128, 256, 512])
+        lat = round(random.uniform(30.0, 200.0), 1)
+        tasks_post.append((f"pc{i+1:02d}", cpu, mem, lat, random.choice(list(PlacementPolicy))))
     for (tid, cpu, mem, lat, pol) in tasks_post:
         r = run_task(tid, cpu, mem, lat, pol, agents)
         results.append(r)
@@ -597,17 +752,22 @@ def scenario_s5_nash() -> dict:
     # Le latenze base dei nodi sono: node-1=15ms, node-2=40ms,
     # node-3=80ms, node-4=25ms  (piu' jitter fino a +15ms)
     # Quindi requisiti < 20ms rendono difficile trovare NE al primo round.
-    tasks = [
-        # (id,   cpu,  mem,  max_lat, policy)
-        ("n01", 1.0,  256,  12.0, PlacementPolicy.LATENCY_FIRST),  # quasi impossibile
-        ("n02", 2.0,  512,  18.0, PlacementPolicy.BALANCED),       # molto stretta
-        ("n03", 0.5,  128,  10.0, PlacementPolicy.LATENCY_FIRST),  # impossibile greedy
-        ("n04", 4.0, 1024,  20.0, PlacementPolicy.LATENCY_FIRST),  # stretta + pesante
-        ("n05", 1.0,  256,  15.0, PlacementPolicy.ENERGY_FIRST),   # stretta
-        ("n06", 2.0,  512,  25.0, PlacementPolicy.BALANCED),       # al limite
-        ("n07", 0.5,  128,   8.0, PlacementPolicy.LATENCY_FIRST),  # impossibile greedy
-        ("n08", 3.0,  768,  22.0, PlacementPolicy.BALANCED),       # stretta + media
-    ]
+    # Task con latenze randomizzate ma sempre stringenti (U[8, 28]ms).
+    # La latenza minima raggiungibile è base_latency + jitter_min ≈ 15-5 = 10ms,
+    # quindi latenze < 20ms sono genuinamente difficili per il greedy
+    # ma il Nash IBR può trovare NE rilassando progressivamente.
+    # Randomizzare garantisce che ogni run esplori una regione diversa
+    # dello spazio di allocazione, producendo variabilità reale nel CI.
+    tasks = []
+    cpu_choices = [0.5, 1.0, 2.0, 3.0, 4.0]
+    for i in range(8):
+        cpu = random.choice(cpu_choices)
+        mem = cpu * random.choice([128, 256, 384])
+        # Latenze intenzionalmente stringenti: 60% sotto 15ms (spesso impossibile greedy)
+        lat = round(random.uniform(8.0, 28.0), 1)
+        pol = random.choice([PlacementPolicy.LATENCY_FIRST, PlacementPolicy.BALANCED,
+                             PlacementPolicy.ENERGY_FIRST])
+        tasks.append((f"n{i+1:02d}", cpu, mem, lat, pol))
 
     # ── Run GREEDY (TaskAgent standard — singolo round) ──────────────────────
     print("\n  [GREEDY — singolo round, nessuna negoziazione]")
@@ -630,6 +790,7 @@ def scenario_s5_nash() -> dict:
                                  priority=2, task_type="generic")
         nagent = NashTaskAgent.remote(tid, req, pol,
                                       max_rounds=5, relaxation_factor=0.20)
+        _actor_registry.append(nagent)   # registra per il cleanup post-run
         r = ray.get(nagent.place_nash.remote(nash_agents))
         nash_results.append(r)
         converged = r.get("nash_converged", False)
@@ -695,24 +856,73 @@ def scenario_s5_nash() -> dict:
 
 
 
+def plot_runs_scatter(all_metrics: dict):
+    """
+    Scatter plot delle singole run per ogni scenario e metrica.
+    Permette di vedere la distribuzione dei campioni e giustificare
+    visivamente la larghezza degli intervalli di confidenza.
+    """
+    metrics_info = [
+        ("placement_latency_runs",   "placement_latency_ms",   "Placement Latency (ms)",     "placement_latency_ci"),
+        ("a2a_overhead_runs",        "a2a_overhead_ms",        "A2A Overhead (ms)",           "a2a_overhead_ci"),
+        ("sla_violation_rate_runs",  "sla_violation_rate",     "SLA Violation Rate",          "sla_violation_rate_ci"),
+        ("crdt_convergence_ms_runs", "crdt_convergence_ms",    "CRDT Convergence (ms)",       "crdt_convergence_ms_ci"),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+    fig.suptitle(f"Distribuzione delle {N_RUNS} run indipendenti per scenario",
+                 fontsize=14, fontweight="bold")
+
+    scenarios = list(all_metrics.keys())
+    for ax, (runs_key, mean_key, ylabel, ci_key) in zip(axes.flat, metrics_info):
+        for i, s in enumerate(scenarios):
+            runs = all_metrics[s].get(runs_key, [])
+            mean_val = all_metrics[s].get(mean_key, 0)
+            ci_val   = all_metrics[s].get(ci_key, 0)
+            color    = SCENARIO_COLORS[s]
+            jitter   = np.random.normal(0, 0.08, len(runs))
+            ax.scatter([i + j for j in jitter], runs, color=color,
+                       alpha=0.5, s=25, zorder=3)
+            ax.errorbar(i, mean_val, yerr=ci_val, fmt="D",
+                        color=color, markeredgecolor="black",
+                        capsize=6, linewidth=2, markersize=7, zorder=4)
+
+        ax.set_xticks(range(len(scenarios)))
+        ax.set_xticklabels(scenarios, fontsize=7, rotation=10)
+        ax.set_ylabel(ylabel, fontsize=10)
+        ax.set_title(ylabel, fontweight="bold", fontsize=11)
+        ax.grid(axis="y", linestyle="--", alpha=0.4)
+        ax.set_axisbelow(True)
+
+    plt.tight_layout()
+    path = os.path.join(RESULTS_DIR, "plot_runs_scatter.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Salvato: {path}")
+
+
 def plot_placement_latency(all_metrics: dict):
     fig, ax = plt.subplots(figsize=(8, 5))
     scenarios = list(all_metrics.keys())
     means = [all_metrics[s]["placement_latency_ms"] for s in scenarios]
-    stds  = [all_metrics[s].get("placement_latency_std", 0) for s in scenarios]
+    # Usa CI al 95% se disponibile, altrimenti std
+    errs  = [all_metrics[s].get("placement_latency_ci",
+             all_metrics[s].get("placement_latency_std", 0)) for s in scenarios]
     colors = [SCENARIO_COLORS[s] for s in scenarios]
 
     bars = ax.bar(scenarios, means, color=colors, width=0.5,
                   edgecolor="white", linewidth=1.2, zorder=3)
-    ax.errorbar(scenarios, means, yerr=stds, fmt="none",
-                color="black", capsize=5, linewidth=1.5, zorder=4)
+    ax.errorbar(scenarios, means, yerr=errs, fmt="none",
+                color="black", capsize=5, linewidth=1.5, zorder=4,
+                label="95% CI")
 
     for bar, val in zip(bars, means):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
                 f"{val:.1f}", ha="center", va="bottom", fontsize=10, fontweight="bold")
 
+    n_runs = next(iter(all_metrics.values())).get("n_runs", 1)
     ax.set_ylabel("Placement Latency (ms)", fontsize=12)
-    ax.set_title("Placement Latency per Scenario", fontsize=14, fontweight="bold")
+    ax.set_title(f"Placement Latency per Scenario  (n={n_runs} run, barre = 95% CI)",
+                 fontsize=13, fontweight="bold")
     ax.set_ylim(0, max(means) * 1.3)
     ax.grid(axis="y", linestyle="--", alpha=0.5, zorder=0)
     ax.set_axisbelow(True)
@@ -727,20 +937,23 @@ def plot_a2a_overhead(all_metrics: dict):
     fig, ax = plt.subplots(figsize=(8, 5))
     scenarios = list(all_metrics.keys())
     means = [all_metrics[s]["a2a_overhead_ms"] for s in scenarios]
-    stds  = [all_metrics[s].get("a2a_overhead_std", 0) for s in scenarios]
+    errs  = [all_metrics[s].get("a2a_overhead_ci",
+             all_metrics[s].get("a2a_overhead_std", 0)) for s in scenarios]
     colors = [SCENARIO_COLORS[s] for s in scenarios]
 
     bars = ax.bar(scenarios, means, color=colors, width=0.5,
                   edgecolor="white", linewidth=1.2, zorder=3)
-    ax.errorbar(scenarios, means, yerr=stds, fmt="none",
+    ax.errorbar(scenarios, means, yerr=errs, fmt="none",
                 color="black", capsize=5, linewidth=1.5, zorder=4)
 
     for bar, val in zip(bars, means):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
                 f"{val:.1f}", ha="center", va="bottom", fontsize=10, fontweight="bold")
 
+    n_runs = next(iter(all_metrics.values())).get("n_runs", 1)
     ax.set_ylabel("A2A Overhead (ms)", fontsize=12)
-    ax.set_title("A2A Protocol Overhead per Scenario", fontsize=14, fontweight="bold")
+    ax.set_title(f"A2A Protocol Overhead per Scenario  (n={n_runs} run, barre = 95% CI)",
+                 fontsize=13, fontweight="bold")
     ax.set_ylim(0, max(means) * 1.3)
     ax.grid(axis="y", linestyle="--", alpha=0.5, zorder=0)
     ax.set_axisbelow(True)
@@ -769,8 +982,10 @@ def plot_sla_violations(all_metrics: dict):
                label="Soglia SLA (10%)", zorder=4)
     ax.legend(fontsize=10)
 
+    n_runs = next(iter(all_metrics.values())).get("n_runs", 1)
     ax.set_ylabel("SLA Violation Rate (%)", fontsize=12)
-    ax.set_title("SLA Violation Rate per Scenario", fontsize=14, fontweight="bold")
+    ax.set_title(f"SLA Violation Rate per Scenario  (n={n_runs} run)",
+                 fontsize=13, fontweight="bold")
     ax.set_ylim(0, max(max(rates) * 1.3, 15))
     ax.grid(axis="y", linestyle="--", alpha=0.5, zorder=0)
     ax.set_axisbelow(True)
@@ -785,17 +1000,22 @@ def plot_crdt_convergence(all_metrics: dict):
     fig, ax = plt.subplots(figsize=(8, 5))
     scenarios = list(all_metrics.keys())
     times = [all_metrics[s]["crdt_convergence_ms"] for s in scenarios]
+    errs  = [all_metrics[s].get("crdt_convergence_ms_ci", 0) for s in scenarios]
     colors = [SCENARIO_COLORS[s] for s in scenarios]
 
     bars = ax.bar(scenarios, times, color=colors, width=0.5,
                   edgecolor="white", linewidth=1.2, zorder=3)
+    ax.errorbar(scenarios, times, yerr=errs, fmt="none",
+                color="black", capsize=5, linewidth=1.5, zorder=4)
 
     for bar, val in zip(bars, times):
         ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
                 f"{val:.0f}", ha="center", va="bottom", fontsize=10, fontweight="bold")
 
+    n_runs = next(iter(all_metrics.values())).get("n_runs", 1)
     ax.set_ylabel("Convergence Time (ms)", fontsize=12)
-    ax.set_title("CRDT Convergence Time per Scenario", fontsize=14, fontweight="bold")
+    ax.set_title(f"CRDT Convergence Time per Scenario  (n={n_runs} run, barre = 95% CI)",
+                 fontsize=13, fontweight="bold")
     ax.set_ylim(0, max(times) * 1.3)
     ax.grid(axis="y", linestyle="--", alpha=0.5, zorder=0)
     ax.set_axisbelow(True)
@@ -819,14 +1039,20 @@ def plot_summary_dashboard(all_metrics: dict):
     x         = np.arange(len(scenarios))
     bar_w     = 0.5
 
+    n_runs = next(iter(all_metrics.values())).get("n_runs", 1)
+    fig.suptitle(f"Fase 4 — Riepilogo Metriche per Scenario  "
+                 f"(n={n_runs} run indipendenti, barre = 95% CI)",
+                 fontsize=14, fontweight="bold", y=1.01)
+
     # ── (0,0) Placement Latency ──────────────────────────────
     ax = axes[0][0]
     vals = [all_metrics[s]["placement_latency_ms"] for s in scenarios]
-    stds = [all_metrics[s].get("placement_latency_std", 0) for s in scenarios]
+    errs = [all_metrics[s].get("placement_latency_ci",
+            all_metrics[s].get("placement_latency_std", 0)) for s in scenarios]
     ax.bar(x, vals, width=bar_w, color=colors, edgecolor="white", zorder=3)
-    ax.errorbar(x, vals, yerr=stds, fmt="none", color="black", capsize=4, zorder=4)
+    ax.errorbar(x, vals, yerr=errs, fmt="none", color="black", capsize=4, zorder=4)
     ax.set_xticks(x); ax.set_xticklabels(scenarios, fontsize=8)
-    ax.set_title("Placement Latency (ms)", fontweight="bold")
+    ax.set_title("Placement Latency (ms) ± 95% CI", fontweight="bold")
     ax.set_ylim(0, max(vals) * 1.35)
     ax.grid(axis="y", linestyle="--", alpha=0.4, zorder=0)
     for xi, v in zip(x, vals):
@@ -835,11 +1061,12 @@ def plot_summary_dashboard(all_metrics: dict):
     # ── (0,1) A2A Overhead ───────────────────────────────────
     ax = axes[0][1]
     vals = [all_metrics[s]["a2a_overhead_ms"] for s in scenarios]
-    stds = [all_metrics[s].get("a2a_overhead_std", 0) for s in scenarios]
+    errs = [all_metrics[s].get("a2a_overhead_ci",
+            all_metrics[s].get("a2a_overhead_std", 0)) for s in scenarios]
     ax.bar(x, vals, width=bar_w, color=colors, edgecolor="white", zorder=3)
-    ax.errorbar(x, vals, yerr=stds, fmt="none", color="black", capsize=4, zorder=4)
+    ax.errorbar(x, vals, yerr=errs, fmt="none", color="black", capsize=4, zorder=4)
     ax.set_xticks(x); ax.set_xticklabels(scenarios, fontsize=8)
-    ax.set_title("A2A Protocol Overhead (ms)", fontweight="bold")
+    ax.set_title("A2A Protocol Overhead (ms) ± 95% CI", fontweight="bold")
     ax.set_ylim(0, max(vals) * 1.35)
     ax.grid(axis="y", linestyle="--", alpha=0.4, zorder=0)
     for xi, v in zip(x, vals):
@@ -848,12 +1075,14 @@ def plot_summary_dashboard(all_metrics: dict):
     # ── (1,0) SLA Violation Rate ─────────────────────────────
     ax = axes[1][0]
     vals = [all_metrics[s]["sla_violation_rate"] * 100 for s in scenarios]
+    errs = [all_metrics[s].get("sla_violation_rate_ci", 0) * 100 for s in scenarios]
     ax.bar(x, vals, width=bar_w, color=colors, edgecolor="white", zorder=3)
+    ax.errorbar(x, vals, yerr=errs, fmt="none", color="black", capsize=4, zorder=4)
     ax.axhline(y=10, color="red", linestyle="--", linewidth=1.3,
                label="Soglia 10%", zorder=4)
     ax.legend(fontsize=8)
     ax.set_xticks(x); ax.set_xticklabels(scenarios, fontsize=8)
-    ax.set_title("SLA Violation Rate (%)", fontweight="bold")
+    ax.set_title("SLA Violation Rate (%) ± 95% CI", fontweight="bold")
     ax.set_ylim(0, max(max(vals) * 1.35, 15))
     ax.grid(axis="y", linestyle="--", alpha=0.4, zorder=0)
     for xi, v in zip(x, vals):
@@ -862,9 +1091,11 @@ def plot_summary_dashboard(all_metrics: dict):
     # ── (1,1) CRDT Convergence ───────────────────────────────
     ax = axes[1][1]
     vals = [all_metrics[s]["crdt_convergence_ms"] for s in scenarios]
+    errs = [all_metrics[s].get("crdt_convergence_ms_ci", 0) for s in scenarios]
     ax.bar(x, vals, width=bar_w, color=colors, edgecolor="white", zorder=3)
+    ax.errorbar(x, vals, yerr=errs, fmt="none", color="black", capsize=4, zorder=4)
     ax.set_xticks(x); ax.set_xticklabels(scenarios, fontsize=8)
-    ax.set_title("CRDT Convergence Time (ms)", fontweight="bold")
+    ax.set_title("CRDT Convergence Time (ms) ± 95% CI", fontweight="bold")
     ax.set_ylim(0, max(vals) * 1.35)
     ax.grid(axis="y", linestyle="--", alpha=0.4, zorder=0)
     for xi, v in zip(x, vals):
@@ -1036,52 +1267,67 @@ def plot_nash_convergence(s5_metrics: dict):
 def sep(c="═", w=65): print(c * w)
 
 def main():
-    sep(); print("  FASE 4 — Experimentation & Evaluation"); sep()
+    sep()
+    print(f"  FASE 4 — Experimentation & Evaluation  [{N_RUNS} run per scenario]")
+    sep()
     ray.init(ignore_reinit_error=True)
-
-    # ── Aggiunge metodo mark_offline_self agli agenti ────────────
-    # (necessario per S3 — viene chiamato sull'agente da remoto)
 
     all_metrics: Dict[str, Any] = {}
 
-    # ── Esecuzione scenari ───────────────────────────────────────
+    # ── Ogni scenario viene eseguito N_RUNS volte. ───────────────
+    # Le metriche scalari di ciascuna run sono campioni i.i.d.
+    # Il CI al 95% si restringe come 1/sqrt(N_RUNS).
+    # ─────────────────────────────────────────────────────────────
     sep("─")
     print("SCENARIO 1 — Baseline"); sep("─")
-    all_metrics["S1 Baseline"] = scenario_baseline()
+    all_metrics["S1 Baseline"] = run_scenario_n_times(
+        scenario_baseline, "S1 Baseline", N_RUNS)
 
     sep("─")
     print("SCENARIO 2 — High Load"); sep("─")
-    all_metrics["S2 High Load"] = scenario_high_load()
+    all_metrics["S2 High Load"] = run_scenario_n_times(
+        scenario_high_load, "S2 High Load", N_RUNS)
 
     sep("─")
     print("SCENARIO 3 — Node Failure"); sep("─")
-    all_metrics["S3 Node Failure"] = scenario_node_failure()
+    all_metrics["S3 Node Failure"] = run_scenario_n_times(
+        scenario_node_failure, "S3 Node Failure", N_RUNS)
 
     sep("─")
     print("SCENARIO 4 — Network Partition"); sep("─")
-    all_metrics["S4 Net Partition"] = scenario_network_partition()
+    all_metrics["S4 Net Partition"] = run_scenario_n_times(
+        scenario_network_partition, "S4 Net Partition", N_RUNS)
 
     sep("─")
     print("SCENARIO 5 — Nash Equilibrium (Greedy vs IBR)"); sep("─")
-    all_metrics["S5 Nash Equil."] = scenario_s5_nash()
+    all_metrics["S5 Nash Equil."] = run_scenario_n_times(
+        scenario_s5_nash, "S5 Nash Equil.", N_RUNS)
 
-    # ── Riepilogo testuale ───────────────────────────────────────
+    # ── Riepilogo testuale con CI ────────────────────────────────
     sep()
-    print("  RIEPILOGO METRICHE")
+    print("  RIEPILOGO METRICHE  (media ± 95% CI su run indipendenti)")
     sep()
-    print(f"{'Scenario':<22} {'PlacLat(ms)':<14} {'A2A(ms)':<12} "
-          f"{'SLA viol%':<12} {'CRDT conv(ms)'}")
+    print(f"{'Scenario':<22} {'PlacLat ms':<20} {'A2A ms':<18} "
+          f"{'SLA viol%':<18} {'CRDT ms'}")
+    print(f"{'':22} {'mean ± CI':<20} {'mean ± CI':<18} "
+          f"{'mean ± CI':<18} {'mean ± CI'}")
     sep("─")
     for s, m in all_metrics.items():
-        print(f"{s:<22} "
-              f"{m['placement_latency_ms']:<14.1f} "
-              f"{m['a2a_overhead_ms']:<12.1f} "
-              f"{m['sla_violation_rate']*100:<12.1f} "
-              f"{m['crdt_convergence_ms']:.1f}")
+        lat_ci  = m.get("placement_latency_ci", 0)
+        a2a_ci  = m.get("a2a_overhead_ci", 0)
+        sla_ci  = m.get("sla_violation_rate_ci", 0) * 100
+        crdt_ci = m.get("crdt_convergence_ms_ci", 0)
+        print(
+            f"{s:<22} "
+            f"{m['placement_latency_ms']:.1f} ± {lat_ci:.2f} ms".ljust(20) +
+            f"  {m['a2a_overhead_ms']:.1f} ± {a2a_ci:.2f}".ljust(18) +
+            f"  {m['sla_violation_rate']*100:.1f} ± {sla_ci:.1f}%".ljust(18) +
+            f"  {m['crdt_convergence_ms']:.1f} ± {crdt_ci:.1f}"
+        )
 
     # ── Salva dati grezzi ────────────────────────────────────────
     raw_path = os.path.join(RESULTS_DIR, "raw_results.json")
-    # Converti numpy types per JSON serialization
+
     def to_serializable(obj):
         if isinstance(obj, (np.float64, np.float32)):
             return float(obj)
@@ -1106,11 +1352,12 @@ def main():
     plot_sla_violations(all_metrics)
     plot_crdt_convergence(all_metrics)
     plot_summary_dashboard(all_metrics)
+    plot_runs_scatter(all_metrics)
     plot_partition_crdt_divergence(all_metrics["S4 Net Partition"])
     plot_nash_convergence(all_metrics["S5 Nash Equil."])
 
     sep()
-    print("  FASE 4 COMPLETATA")
+    print(f"  FASE 4 COMPLETATA  ({N_RUNS} run per scenario)")
     print(f"  Grafici in: {RESULTS_DIR}/")
     sep()
 
