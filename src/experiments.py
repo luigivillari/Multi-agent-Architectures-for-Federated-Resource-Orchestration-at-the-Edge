@@ -47,7 +47,7 @@ from crdt_catalogue import ResourceCatalogue
 # Configurazione globale
 # ─────────────────────────────────────────────
 
-RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results_CI")
+RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results_CI_v4")
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
 EDGE_NODES = [
@@ -70,8 +70,6 @@ SCENARIOS = list(SCENARIO_COLORS.keys())
 
 # ─────────────────────────────────────────────
 # Numero di run indipendenti per scenario
-# Aumentare per intervalli di confidenza più stretti.
-# Con N=30 il CI si dimezza rispetto a N=5.
 # ─────────────────────────────────────────────
 N_RUNS = 30
 
@@ -115,79 +113,24 @@ def kill_registered_actors():
     time.sleep(0.2)
 
 
-def run_task(task_id: str, cpu: float, mem: float, max_lat: float,
-             policy: PlacementPolicy, resource_agents: list) -> dict:
+def run_task_via_agent(task_id: str, cpu: float, mem: float, max_lat: float,
+                       policy: PlacementPolicy, resource_agents: list) -> dict:
     """
-    Esegue la negoziazione per un singolo task e ritorna il risultato
-    arricchito con timing granulare per le metriche Fase 4.
+    Crea un TaskAgent Ray Actor e lo usa per la negoziazione CNP.
+
+    Questa è la vera comunicazione A2A: il TaskAgent è un processo Ray
+    isolato che invia messaggi CFP agli ResourceAgent (anch'essi Actor)
+    e riceve le risposte tramite il message-passing di Ray.
     """
     req = TaskRequirements(cpu_cores=cpu, memory_mb=mem,
                            max_latency_ms=max_lat, duration_sec=10,
                            priority=2, task_type="generic")
-
-    # ── misura A2A overhead: solo fase broadcast + raccolta risposte ──
-    cfp = make_cfp(f"task-{task_id}", task_id, req)
-    t_cfp = time.time()
-    response_refs = [a.receive_cfp.remote(cfp) for a in resource_agents]
-    responses = ray.get(response_refs)
-    t_responses = time.time()
-    a2a_overhead_ms = (t_responses - t_cfp) * 1000
-
-    # ── fase scoring + accept (placement decision) ──
-    t_placement_start = time.time()
-    proposals = []
-    for resp in responses:
-        if resp and resp.msg_type in (MessageType.PROPOSE, MessageType.COUNTER_OFFER):
-            resp.offer.score = score_offer(resp.offer, policy)
-            proposals.append(resp)
-
-    status = "failed"
-    placed_on = None
-    estimated_latency_ms = None
-    sla_ok = False
-
-    if proposals:
-        best = max(proposals, key=lambda r: r.offer.score)
-        winner_idx = next(
-            i for i, a in enumerate(resource_agents)
-            if ray.get(a.get_state.remote())["node_id"] == best.sender_id
-        )
-        from protocol import make_accept, make_reject
-        accept_msg = make_accept(f"task-{task_id}", best.sender_id,
-                                 task_id, cfp.conversation_id)
-        ray.get(resource_agents[winner_idx].receive_accept.remote(accept_msg))
-
-        # Reject agli altri
-        for resp in proposals:
-            if resp.sender_id != best.sender_id:
-                loser_idx = next(
-                    i for i, a in enumerate(resource_agents)
-                    if ray.get(a.get_state.remote())["node_id"] == resp.sender_id
-                )
-                resource_agents[loser_idx].receive_reject.remote(
-                    make_reject(f"task-{task_id}", resp.sender_id,
-                                task_id, cfp.conversation_id, "better_offer")
-                )
-
-        status = "placed"
-        placed_on = best.sender_id
-        estimated_latency_ms = best.offer.estimated_latency_ms
-        sla_ok = estimated_latency_ms <= max_lat
-
-    t_placement_end = time.time()
-    placement_latency_ms = (t_placement_end - t_placement_start) * 1000 + a2a_overhead_ms
-
-    return {
-        "task_id":              task_id,
-        "status":               status,
-        "placed_on":            placed_on,
-        "placement_latency_ms": placement_latency_ms,
-        "a2a_overhead_ms":      a2a_overhead_ms,
-        "estimated_latency_ms": estimated_latency_ms,
-        "max_latency_ms":       max_lat,
-        "sla_ok":               sla_ok,
-        "proposals_received":   len(proposals),
-    }
+    agent = TaskAgent.remote(task_id, req, policy)
+    _actor_registry.append(agent)
+    result = ray.get(agent.place.remote(resource_agents))
+    # Rimuove dead_agent_indices dal result (non è una metrica da aggregare)
+    result.pop("dead_agent_indices", None)
+    return result
 
 
 def gossip_round(agents: list) -> float:
@@ -390,7 +333,7 @@ def scenario_baseline() -> dict:
 
     results = []
     for (tid, cpu, mem, lat, pol) in tasks:
-        r = run_task(tid, cpu, mem, lat, pol, agents)
+        r = run_task_via_agent(tid, cpu, mem, lat, pol, agents)
         results.append(r)
         print(f"  {tid}: {r['status']} on {r['placed_on']} | "
               f"lat={r['placement_latency_ms']:.1f}ms | SLA={'OK' if r['sla_ok'] else 'VIOLATION'}")
@@ -427,7 +370,7 @@ def scenario_high_load() -> dict:
 
     results = []
     for (tid, cpu, mem, lat, pol) in tasks:
-        r = run_task(tid, cpu, mem, lat, pol, agents)
+        r = run_task_via_agent(tid, cpu, mem, lat, pol, agents)
         results.append(r)
         print(f"  {tid}: {r['status']:6s} | proposals={r['proposals_received']} | "
               f"SLA={'OK' if r['sla_ok'] else 'VIOLATION'}")
@@ -444,92 +387,6 @@ def scenario_high_load() -> dict:
 # ─────────────────────────────────────────────
 # Scenario 3 — Node Failure
 # ─────────────────────────────────────────────
-
-def run_task_resilient(task_id: str, cpu: float, mem: float, max_lat: float,
-                       policy: PlacementPolicy, resource_agents: list) -> dict:
-    """
-    Come run_task, ma gestisce RayActorError per singoli agenti morti.
-    Restituisce il risultato normale più 'dead_nodes': lista degli id dei
-    nodi che non hanno risposto (crash rilevato via eccezione Ray).
-    """
-    req = TaskRequirements(cpu_cores=cpu, memory_mb=mem,
-                           max_latency_ms=max_lat, duration_sec=10,
-                           priority=2, task_type="generic")
-    cfp = make_cfp(f"task-{task_id}", task_id, req)
-
-    # Manda CFP a tutti — incluso eventuale nodo morto
-    t_cfp = time.time()
-    refs = [(a, a.receive_cfp.remote(cfp)) for a in resource_agents]
-
-    responses = []
-    dead_agents = []   # oggetti agente (non stringhe) — node_id risolto dal chiamante
-    for agent, ref in refs:
-        try:
-            resp = ray.get(ref)          # RayActorError immediato se l'actor è morto
-            responses.append(resp)
-        except ray.exceptions.RayActorError:
-            dead_agents.append(agent)   # salva l'oggetto, NON chiamare get_state sul morto
-            print(f"  [CRASH DETECTED] Un agente non risponde — RayActorError ricevuto")
-
-    t_responses = time.time()
-    a2a_overhead_ms = (t_responses - t_cfp) * 1000
-
-    # Fase scoring + accept (identica a run_task)
-    t_placement_start = time.time()
-    proposals = []
-    for resp in responses:
-        if resp and resp.msg_type in (MessageType.PROPOSE, MessageType.COUNTER_OFFER):
-            resp.offer.score = score_offer(resp.offer, policy)
-            proposals.append(resp)
-
-    status = "failed"
-    placed_on = None
-    estimated_latency_ms = None
-    sla_ok = False
-
-    if proposals:
-        best = max(proposals, key=lambda r: r.offer.score)
-        winner_idx = next(
-            i for i, a in enumerate(resource_agents)
-            if ray.get(a.get_state.remote())["node_id"] == best.sender_id
-        )
-        from protocol import make_accept, make_reject
-        accept_msg = make_accept(f"task-{task_id}", best.sender_id,
-                                 task_id, cfp.conversation_id)
-        ray.get(resource_agents[winner_idx].receive_accept.remote(accept_msg))
-
-        for resp in proposals:
-            if resp.sender_id != best.sender_id:
-                loser_idx = next(
-                    i for i, a in enumerate(resource_agents)
-                    if ray.get(a.get_state.remote())["node_id"] == resp.sender_id
-                )
-                resource_agents[loser_idx].receive_reject.remote(
-                    make_reject(f"task-{task_id}", resp.sender_id,
-                                task_id, cfp.conversation_id, "better_offer")
-                )
-
-        status = "placed"
-        placed_on = best.sender_id
-        estimated_latency_ms = best.offer.estimated_latency_ms
-        sla_ok = estimated_latency_ms <= max_lat
-
-    t_placement_end = time.time()
-    placement_latency_ms = (t_placement_end - t_placement_start) * 1000 + a2a_overhead_ms
-
-    return {
-        "task_id":              task_id,
-        "status":               status,
-        "placed_on":            placed_on,
-        "placement_latency_ms": placement_latency_ms,
-        "a2a_overhead_ms":      a2a_overhead_ms,
-        "estimated_latency_ms": estimated_latency_ms,
-        "max_latency_ms":       max_lat,
-        "sla_ok":               sla_ok,
-        "proposals_received":   len(proposals),
-        "dead_agents":          dead_agents,   # oggetti agente, non stringhe
-    }
-
 
 def scenario_node_failure() -> dict:
     """
@@ -559,7 +416,7 @@ def scenario_node_failure() -> dict:
     results = []
     print("  [PRE-FAILURE] Tutti i nodi attivi:")
     for (tid, cpu, mem, lat, pol) in tasks_pre:
-        r = run_task(tid, cpu, mem, lat, pol, agents)
+        r = run_task_via_agent(tid, cpu, mem, lat, pol, agents)
         results.append(r)
         print(f"    {tid}: {r['status']:6s} on {r['placed_on']} | "
               f"SLA={'OK' if r['sla_ok'] else 'VIOLATION'}")
@@ -585,44 +442,58 @@ def scenario_node_failure() -> dict:
         pol = random.choice(list(PlacementPolicy))
         tasks_post.append((f"f{i+6:02d}", cpu, mem, lat, pol))
 
-    print("  [POST-FAILURE] Invio CFP a tutti i nodi (crash non ancora rilevato)...")
+    print("  [POST-FAILURE] TaskAgent invia CFP a tutti i nodi (crash non ancora noto)...")
     for (tid, cpu, mem, lat, pol) in tasks_post:
-        r = run_task_resilient(tid, cpu, mem, lat, pol, active_agents)
+        # run_task_via_agent usa TaskAgent.place() che gestisce RayActorError
+        # internamente e restituisce dead_agent_indices (lista di indici interi)
+        req = TaskRequirements(cpu_cores=cpu, memory_mb=mem,
+                               max_latency_ms=lat, duration_sec=10,
+                               priority=2, task_type="generic")
+        ta = TaskAgent.remote(tid, req, pol)
+        _actor_registry.append(ta)
+        r = ray.get(ta.place.remote(active_agents))
         r["post_failure"] = True
 
-        # Prima rilevazione del crash
-        if r["dead_agents"] and not crash_detected:
+        dead_indices = r.pop("dead_agent_indices", [])
+
+        # Prima rilevazione del crash tramite dead_agent_indices
+        if dead_indices and not crash_detected:
             crash_detected = True
             t_detect = time.time()
-            print(f"\n  [FAILURE DETECTED] Crash rilevato {(t_detect - t_failure)*1000:.1f}ms "
-                  f"dopo il kill — aggiornamento CRDT in corso...")
+            print(f"\n  [FAILURE DETECTED] Crash rilevato dal TaskAgent "
+                  f"{(t_detect - t_failure)*1000:.1f}ms dopo il kill — "
+                  f"aggiornamento CRDT in corso...")
 
-            for dead_agent in r["dead_agents"]:
-                # Usa la mappa pre-costruita: nessuna chiamata al nodo morto
+            for idx in dead_indices:
+                dead_agent = active_agents[idx]
+                # Usa agent_id_map pre-costruita: nessuna chiamata al nodo morto
                 dead_id = agent_id_map.get(dead_agent, "unknown")
                 survivors = [a for a in active_agents if a is not dead_agent]
-                # Ogni nodo sopravvissuto aggiorna il proprio catalogo CRDT
                 for survivor in survivors:
                     survivor.mark_node_offline_external.remote(dead_id)
                 active_agents = survivors
                 print(f"  [CRDT UPDATE] {len(survivors)} nodi sopravvissuti hanno "
                       f"marcato {dead_id} offline nel catalogo CRDT\n")
 
-        # Sostituisci ActorHandle (non serializzabile JSON) con booleano
-        crash_this_task = bool(r["dead_agents"])
-        r["crash_detected"] = crash_this_task
-        del r["dead_agents"]
-
+        r["crash_detected"] = bool(dead_indices)
         results.append(r)
         print(f"    {tid}: {r['status']:6s} on {r.get('placed_on') or '—'} | "
               f"SLA={'OK' if r['sla_ok'] else 'VIOLATION'}"
-              + (" | CRASH RILEVATO" if crash_this_task else ""))
+              + (" | CRASH RILEVATO DAL TaskAgent" if dead_indices else ""))
 
     # Gossip finale tra i sopravvissuti per convergenza CRDT
     t_conv = measure_convergence_time(active_agents) if len(active_agents) > 1 else 0.0
     print(f"\n  CRDT convergence (nodi sopravvissuti): {t_conv:.1f}ms")
 
-    metrics = compute_metrics(results)
+    pre_failure_results = results[:len(tasks_pre)]
+    metrics = compute_metrics(pre_failure_results)
+
+    # SLA violation rate su TUTTI i task (pre + post) — riflette l'impatto reale
+    all_placed = [r for r in results if r["status"] == "placed"]
+    all_violations = sum(1 for r in all_placed if not r["sla_ok"])
+    if all_placed:
+        metrics["sla_violation_rate"] = all_violations / len(all_placed)
+
     metrics["crdt_convergence_ms"] = t_conv
     metrics["failure_detected_ms"] = (t_detect - t_failure) * 1000 if t_detect else 0.0
     metrics["task_results"] = results
@@ -674,7 +545,7 @@ def scenario_network_partition() -> dict:
     for (tid, cpu, mem, lat, pol) in tasks_a:
         # Sync solo dentro isola A
         gossip_round(island_a)
-        r = run_task(tid, cpu, mem, lat, pol, island_a)
+        r = run_task_via_agent(tid, cpu, mem, lat, pol, island_a)
         results.append(r)
         print(f"    {tid}: {r['status']:6s} on {r['placed_on']}")
 
@@ -682,7 +553,7 @@ def scenario_network_partition() -> dict:
     for (tid, cpu, mem, lat, pol) in tasks_b:
         # Sync solo dentro isola B
         gossip_round(island_b)
-        r = run_task(tid, cpu, mem, lat, pol, island_b)
+        r = run_task_via_agent(tid, cpu, mem, lat, pol, island_b)
         results.append(r)
         print(f"    {tid}: {r['status']:6s} on {r['placed_on']}")
 
@@ -714,7 +585,7 @@ def scenario_network_partition() -> dict:
         lat = round(random.uniform(30.0, 200.0), 1)
         tasks_post.append((f"pc{i+1:02d}", cpu, mem, lat, random.choice(list(PlacementPolicy))))
     for (tid, cpu, mem, lat, pol) in tasks_post:
-        r = run_task(tid, cpu, mem, lat, pol, agents)
+        r = run_task_via_agent(tid, cpu, mem, lat, pol, agents)
         results.append(r)
         print(f"    {tid}: {r['status']:6s} on {r['placed_on']}")
 
@@ -748,16 +619,7 @@ def scenario_s5_nash() -> dict:
     """
     print("\n[S5] Nash Equilibrium — Greedy vs. Iterative Best Response")
 
-    # Task con latenze MOLTO stringenti: forzano piu' round di negoziazione.
-    # Le latenze base dei nodi sono: node-1=15ms, node-2=40ms,
-    # node-3=80ms, node-4=25ms  (piu' jitter fino a +15ms)
-    # Quindi requisiti < 20ms rendono difficile trovare NE al primo round.
-    # Task con latenze randomizzate ma sempre stringenti (U[8, 28]ms).
-    # La latenza minima raggiungibile è base_latency + jitter_min ≈ 15-5 = 10ms,
-    # quindi latenze < 20ms sono genuinamente difficili per il greedy
-    # ma il Nash IBR può trovare NE rilassando progressivamente.
-    # Randomizzare garantisce che ogni run esplori una regione diversa
-    # dello spazio di allocazione, producendo variabilità reale nel CI.
+
     tasks = []
     cpu_choices = [0.5, 1.0, 2.0, 3.0, 4.0]
     for i in range(8):
@@ -774,7 +636,7 @@ def scenario_s5_nash() -> dict:
     greedy_agents  = make_resource_agents()
     greedy_results = []
     for (tid, cpu, mem, lat, pol) in tasks:
-        r = run_task(tid, cpu, mem, lat, pol, greedy_agents)
+        r = run_task_via_agent(tid, cpu, mem, lat, pol, greedy_agents)
         greedy_results.append(r)
         lat_str = f"{r['estimated_latency_ms']:.1f}ms" if r["estimated_latency_ms"] else "N/A"
         print(f"    {tid}: {r['status']:6s} | proposals={r['proposals_received']} | "

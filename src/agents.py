@@ -1,7 +1,7 @@
 """
 agents.py
 =========
-Fase 2 — Agent Modelling: ResourceAgent, TaskAgent e NashTaskAgent come Ray Actors
+Fase 2 — Agent Modelling: ResourceAgent e TaskAgent come Ray Actors
 """
 
 import ray
@@ -228,6 +228,20 @@ class TaskAgent:
               f"MEM={requirements.memory_mb}MB, LAT_MAX={requirements.max_latency_ms}ms")
 
     def place(self, resource_agents: list) -> dict:
+        """
+        Negoziazione CNP completa via comunicazione A2A tra Actor Ray.
+
+        Questa è la vera interazione Agent-to-Agent: il TaskAgent (Actor)
+        invia messaggi CFP agli ResourceAgent (Actor) e riceve le risposte
+        attraverso il message-passing di Ray, esattamente come avverrebbe
+        su una rete reale tra nodi distribuiti.
+
+        Aggiunto rispetto alla versione originale:
+          - Misura separata di a2a_overhead_ms (broadcast CFP → raccolta risposte)
+          - Gestione RayActorError per fault tolerance (scenario S3 node failure)
+          - dead_agent_indices: indici dei nodi che non hanno risposto (per CRDT update)
+          - sla_ok e max_latency_ms nel risultato (per metriche di valutazione)
+        """
         from protocol import make_cfp
         t_start = time.time()
         self.status = "negotiating"
@@ -237,9 +251,41 @@ class TaskAgent:
                                 "n_agents": len(resource_agents)})
         print(f"[TaskAgent:{self.task_id}] -> CFP inviata a {len(resource_agents)} nodi")
 
-        response_refs = [agent.receive_cfp.remote(cfp) for agent in resource_agents]
-        responses = ray.get(response_refs)
+        # ── Mapping node_id → actor costruito UNA SOLA VOLTA prima della fase CFP ──
+        # Se fatto dopo (come in get_state post-A2A), aggiunge un ray.get() su tutti
+        # i nodi FUORI da a2a_overhead_ms ma DENTRO placement_latency_ms,
+        # introducendo varianza artificiale nei CI. Qui invece è parte del setup
+        # costante, prima di t_cfp, e non inquina la misurazione di placement_latency.
+        # Gestione fault-tolerant: se un nodo è già morto (S3 post-failure),
+        # l'ActorDiedError viene ignorato — l'agente sarà escluso anche durante i CFP.
+        node_id_to_agent = {}
+        for _a in resource_agents:
+            try:
+                _s = ray.get(_a.get_state.remote())
+                node_id_to_agent[_s["node_id"]] = _a
+            except (ray.exceptions.RayActorError,
+                    ray.exceptions.ActorDiedError):
+                pass  # nodo già morto — sarà rilevato come dead_agent durante CFP
 
+        # ── A2A overhead: tempo dal broadcast CFP alla raccolta di tutte le risposte ──
+        # Raccoglie individualmente per gestire crash di singoli nodi (RayActorError)
+        # senza abortire l'intera negoziazione.
+        t_cfp = time.time()
+        refs = [agent.receive_cfp.remote(cfp) for agent in resource_agents]
+        responses = []
+        dead_agent_indices: List[int] = []
+        for idx, ref in enumerate(refs):
+            try:
+                resp = ray.get(ref)
+                responses.append(resp)
+            except ray.exceptions.RayActorError:
+                dead_agent_indices.append(idx)
+                print(f"[TaskAgent:{self.task_id}] [CRASH] Nodo {idx} non risponde "
+                      f"— RayActorError rilevato durante raccolta CFP")
+        t_responses = time.time()
+        a2a_overhead_ms = (t_responses - t_cfp) * 1000
+
+        # ── Scoring delle proposte ricevute ──────────────────────────────────────
         proposals = []
         for resp in responses:
             if resp is None:
@@ -261,52 +307,66 @@ class TaskAgent:
             self.status = "failed"
             t_end = time.time()
             result = {
-                "task_id": self.task_id, "status": "failed",
-                "reason": "no_proposals",
+                "task_id":              self.task_id,
+                "status":               "failed",
+                "reason":               "no_proposals",
                 "placement_latency_ms": (t_end - t_start) * 1000,
-                "proposals_received": 0,
+                "a2a_overhead_ms":      a2a_overhead_ms,
+                "max_latency_ms":       self.requirements.max_latency_ms,
+                "sla_ok":               False,
+                "proposals_received":   0,
+                "dead_agent_indices":   dead_agent_indices,
             }
             print(f"[TaskAgent:{self.task_id}] x Nessuna proposta ricevuta.")
             return result
 
+        # ── Best response: seleziona l'offerta con score massimo ─────────────────
         best   = max(proposals, key=lambda r: r.offer.score)
         losers = [r for r in proposals if r.sender_id != best.sender_id]
-
         print(f"[TaskAgent:{self.task_id}] -> Vincitore: {best.sender_id} "
               f"(score={best.offer.score:.3f})")
 
-        winner_idx = next(i for i, a in enumerate(resource_agents)
-                          if ray.get(a.get_state.remote())["node_id"] == best.sender_id)
+        # ── ACCEPT / REJECT usando il mapping pre-costruito ─────────────────────
+        # Nessun ray.get([get_state.remote()]) post-A2A: il mapping node_id_to_agent
+        # è già disponibile. Questo elimina la principale fonte di varianza in
+        # placement_latency_ms che non era presente in a2a_overhead_ms.
         accept_msg = make_accept(f"task-{self.task_id}", best.sender_id,
                                  self.task_id, cfp.conversation_id)
-        ray.get(resource_agents[winner_idx].receive_accept.remote(accept_msg))
+        ray.get(node_id_to_agent[best.sender_id].receive_accept.remote(accept_msg))
 
         for loser_resp in losers:
-            loser_idx = next(i for i, a in enumerate(resource_agents)
-                             if ray.get(a.get_state.remote())["node_id"] == loser_resp.sender_id)
             reject_msg = make_reject(f"task-{self.task_id}", loser_resp.sender_id,
                                      self.task_id, cfp.conversation_id,
                                      "better_offer_available")
-            resource_agents[loser_idx].receive_reject.remote(reject_msg)
+            node_id_to_agent[loser_resp.sender_id].receive_reject.remote(reject_msg)
 
         t_end = time.time()
         self.status = "placed"
         self.placed_on = best.sender_id
         self.placement_latency_ms = (t_end - t_start) * 1000
 
+        estimated_latency_ms = best.offer.estimated_latency_ms
+        sla_ok = estimated_latency_ms <= self.requirements.max_latency_ms
+
         result = {
-            "task_id": self.task_id, "status": "placed",
-            "placed_on": self.placed_on, "policy": self.policy.value,
-            "score": best.offer.score,
-            "estimated_latency_ms": best.offer.estimated_latency_ms,
-            "energy_score": best.offer.energy_cost_score,
+            "task_id":              self.task_id,
+            "status":               "placed",
+            "placed_on":            self.placed_on,
+            "policy":               self.policy.value,
+            "score":                best.offer.score,
+            "estimated_latency_ms": estimated_latency_ms,
+            "max_latency_ms":       self.requirements.max_latency_ms,
+            "sla_ok":               sla_ok,
+            "energy_score":         best.offer.energy_cost_score,
             "placement_latency_ms": self.placement_latency_ms,
-            "proposals_received": len(proposals),
-            "rejections_received": len(self.rejected_by),
+            "a2a_overhead_ms":      a2a_overhead_ms,
+            "proposals_received":   len(proposals),
+            "rejections_received":  len(self.rejected_by),
+            "dead_agent_indices":   dead_agent_indices,
         }
         self.event_log.append({"event": "placement_success", **result})
         print(f"[TaskAgent:{self.task_id}] Piazzato su {self.placed_on} "
-              f"in {self.placement_latency_ms:.1f}ms")
+              f"in {self.placement_latency_ms:.1f}ms | SLA={'OK' if sla_ok else 'VIOLATION'}")
         return result
 
     def get_status(self) -> dict:

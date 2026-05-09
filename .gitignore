@@ -1,2 +1,6 @@
 src/__pycache__/
 src/venv/
+results_CI_V2
+results_ci_v3
+results_nash
+results_CI_v4/raw_results.json
