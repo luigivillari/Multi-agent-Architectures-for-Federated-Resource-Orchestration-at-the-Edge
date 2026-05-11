@@ -1,97 +1,97 @@
 # Agentic Edge Orchestration — Distributed Systems Project
 
-Sistema multi-agente per l'orchestrazione distribuita di risorse edge, basato su Ray Actor Model, Contract Net Protocol (CNP) e CRDT per la consistenza dello stato distribuito.
+Multi-agent system for distributed edge resource orchestration, based on the Ray Actor Model, Contract Net Protocol (CNP), and CRDTs for distributed state consistency.
 
 ---
 
-## Struttura del progetto
+## Project Structure
 
 ```
 distributed systems project/
 ├── src/
-│   ├── protocol.py            # Tipi di dato e messaggi A2A (CFP, Offer, Accept…)
+│   ├── protocol.py            # Data types and A2A messages (CFP, Offer, Accept…)
 │   ├── crdt_catalogue.py      # CRDT: LWWRegister, NodeSnapshot, ResourceCatalogue
 │   ├── agents.py              # ResourceAgent, TaskAgent, NashTaskAgent (Ray Actors)
-│   ├── main.py                # Demo end-to-end (Fase 3 — simulazione base)
-│   └── experiments.py  # Esperimenti con 30 run
-├── results/             # Output degli esperimenti 
-└── README.md                  # Questo file
+│   ├── main.py                # End-to-end demo (Phase 3 — base simulation)
+│   └── experiments.py         # Experiments with 30 runs
+├── results/                   # Experiment outputs
+└── README.md                  # This file
 ```
 
 ---
 
-## Moduli
+## Modules
 
 ### `protocol.py`
-Definisce le strutture dati condivise tra gli agenti:
-- `TaskRequirements` — requisiti di una task (CPU, memoria, latenza massima, durata, priorità, tipo)
-- `ResourceOffer` — offerta di un nodo (risorse disponibili, punteggio, latenza stimata)
-- `PlacementPolicy` — politica di selezione del nodo: `LATENCY_FIRST`, `ENERGY_FIRST`, `BALANCED`
-- Funzioni helper per costruire messaggi CNP: `make_cfp()`, `make_offer()`, `make_accept()`
+Defines the shared data structures used by all agents:
+- `TaskRequirements` — task requirements (CPU, memory, maximum latency, duration, priority, type)
+- `ResourceOffer` — node offer (available resources, score, estimated latency)
+- `PlacementPolicy` — node selection policy: `LATENCY_FIRST`, `ENERGY_FIRST`, `BALANCED`
+- Helper functions for building CNP messages: `make_cfp()`, `make_offer()`, `make_accept()`
 
 ### `crdt_catalogue.py`
-Implementa la consistenza distribuita senza coordinatore centrale:
-- `LWWRegister` — registro Last-Write-Wins con clock di Lamport e tiebreak lessicografico
-- `NodeSnapshot` — snapshot di un nodo edge (6 registri LWW indipendenti: cpu, memoria, latenza, energia, task attivi, online)
-- `ResourceCatalogue` — G-Map CRDT grow-only; merge commutativo, associativo e idempotente; gossip-based
+Implements distributed consistency without a central coordinator:
+- `LWWRegister` — Last-Write-Wins register with Lamport clock and lexicographic tiebreak
+- `NodeSnapshot` — snapshot of an edge node (6 independent LWW registers: cpu, memory, latency, energy, active tasks, online)
+- `ResourceCatalogue` — grow-only G-Map CRDT; commutative, associative, and idempotent merge; gossip-based
 
 ### `agents.py`
-Implementa gli attori Ray del sistema:
-- `ResourceAgent` — rappresenta un nodo edge fisico; gestisce il proprio stato, risponde ai CFP con offerte, esegue le task accettate, aggiorna il catalogo CRDT via gossip
-- `TaskAgent` — agente che piazza una singola task tramite CNP: invia CFP, seleziona la migliore offerta secondo la policy, invia ACCEPT
-- `NashTaskAgent` — estende `TaskAgent` con Iterative Best Response (IBR): rinegozia i requisiti fino a raggiungere un equilibrio di Nash (massimo 5 round, rilassamento SLA α=0.20 per round)
+Implements the Ray actors of the system:
+- `ResourceAgent` — represents a physical edge node; manages its own state, responds to CFPs with offers, executes accepted tasks, updates the CRDT catalogue via gossip
+- `TaskAgent` — agent that places a single task via CNP: sends CFP, selects the best offer according to the policy, sends ACCEPT
+- `NashTaskAgent` — extends `TaskAgent` with Iterative Best Response (IBR): renegotiates requirements until a Nash Equilibrium is reached (maximum 5 rounds, SLA relaxation α=0.20 per round)
 
 ### `main.py`
-Demo end-to-end della Fase 3. Avvia 4 nodi edge simulati, piazza 8 task con policy diverse e stampa le metriche di placement e lo stato del catalogo CRDT.
+End-to-end demo for Phase 3. Starts 4 simulated edge nodes, places 8 tasks with different policies, and prints placement metrics and the CRDT catalogue state.
 
 ### `experiments.py`
-Suite sperimentale completa (Fase 4). Esegue 30 run indipendenti per 5 scenari e produce grafici con intervalli di confidenza al 95%.
+Full experimental suite (Phase 4). Runs 30 independent runs for 5 scenarios and produces plots with 95% confidence intervals.
 
 ---
 
-## Configurazione dei nodi edge
+## Edge Node Configuration
 
-| Nodo        | CPU (core) | Memoria | Latenza | Energy Score |
-|-------------|-----------|---------|---------|--------------|
-| edge-node-1 | 8.0       | 4096 MB | 15 ms   | 0.3          |
-| edge-node-2 | 4.0       | 2048 MB | 40 ms   | 0.5          |
-| edge-node-3 | 2.0       | 1024 MB | 80 ms   | 0.2          |
-| edge-node-4 | 16.0      | 8192 MB | 25 ms   | 0.8          |
+| Node        | CPU (cores) | Memory  | Latency | Energy Score |
+|-------------|-------------|---------|---------|--------------|
+| edge-node-1 | 8.0         | 4096 MB | 15 ms   | 0.3          |
+| edge-node-2 | 4.0         | 2048 MB | 40 ms   | 0.5          |
+| edge-node-3 | 2.0         | 1024 MB | 80 ms   | 0.2          |
+| edge-node-4 | 16.0        | 8192 MB | 25 ms   | 0.8          |
 
 ---
 
-## Dipendenze
+## Dependencies
 
 ```bash
 pip install ray matplotlib numpy
 ```
 
-Versione Python consigliata: **3.10+**
+Recommended Python version: **3.10+**
 
-> Ray deve essere installato nella stessa versione su tutti i nodi del cluster (se si usa un cluster reale). Per la simulazione locale, un singolo nodo è sufficiente.
+> Ray must be installed at the same version across all cluster nodes (if using a real cluster). For local simulation, a single node is sufficient.
 
 ---
 
-## Esecuzione
+## Running the Project
 
-### Demo base (Fase 3)
+### Base Demo (Phase 3)
 
-Avvia la simulazione end-to-end con 4 nodi e 8 task:
+Starts the end-to-end simulation with 4 nodes and 8 tasks:
 
 ```bash
 cd src/
 python main.py
 ```
 
-Output atteso:
-- Tabella di placement per ogni task (nodo assegnato, policy, score, overhead A2A, latenza stimata)
-- Stato di ogni nodo edge dopo il placement (CPU/memoria residua, task attivi)
-- Percentuale di convergenza del catalogo CRDT dopo un round di gossip
-- File `src/results.json` con i risultati in formato JSON
+Expected output:
+- Placement table for each task (assigned node, policy, score, A2A overhead, estimated latency)
+- State of each edge node after placement (remaining CPU/memory, active tasks)
+- CRDT catalogue convergence percentage after one gossip round
+- File `src/results.json` with results in JSON format
 
-### Esperimenti completi (Fase 4)
+### Full Experiments (Phase 4)
 
-Esegue i 5 scenari sperimentali con 30 run ciascuno:
+Runs the 5 experimental scenarios with 30 runs each:
 
 ```bash
 cd src/
@@ -99,37 +99,34 @@ python experiments.py
 ```
 
 Output:
-- `results/raw_results.json` — dati grezzi di tutti i run per ogni scenario
-- `results/plot_placement_latency.png` — latenza di placement media ± IC 95%
-- `results/plot_a2a_overhead.png` — overhead A2A medio ± IC 95%
-- `results/plot_sla_violations.png` — tasso di SLA violation ± IC 95%
-- `results/plot_crdt_convergence.png` — tempo di convergenza CRDT ± IC 95%
-- `results/plot_partition_divergence.png` — divergenza del catalogo durante partizione di rete (S4)
-- `results/plot_nash_convergence.png` — round di IBR per task e convergenza all'equilibrio di Nash (S5)
-- `results/summary_dashboard.png` — dashboard riepilogativa di tutti gli scenari
-
-> **Tempo di esecuzione stimato:** circa 5–15 minuti su un laptop moderno, in base alle risorse disponibili per Ray.
+- `results/raw_results.json` — raw data from all runs for each scenario
+- `results/plot_placement_latency.png` — mean placement latency ± 95% CI
+- `results/plot_a2a_overhead.png` — mean A2A overhead ± 95% CI
+- `results/plot_sla_violations.png` — SLA violation rate ± 95% CI
+- `results/plot_crdt_convergence.png` — CRDT convergence time ± 95% CI
+- `results/plot_partition_divergence.png` — catalogue divergence during network partition (S4)
+- `results/plot_nash_convergence.png` — IBR rounds per task and Nash Equilibrium convergence (S5)
+- `results/summary_dashboard.png` — summary dashboard across all scenarios
 
 ---
 
-## Scenari sperimentali
+## Experimental Scenarios
 
-| ID | Nome               | Descrizione                                                              |
-|----|--------------------|--------------------------------------------------------------------------|
-| S1 | Baseline           | 10 task su 4 nodi con pieno utilizzo; misura le metriche nominali        |
-| S2 | High Load          | 20 task su 4 nodi (overload); valuta il comportamento in caso di rigetto |
-| S3 | Node Failure       | Crash di edge-node-1 durante l'esecuzione; test di fault tolerance        |
-| S4 | Network Partition  | Partizione di rete tra i nodi; verifica della consistenza CRDT al ripristino |
-| S5 | Nash Equilibrium   | 8 task con `NashTaskAgent`; confronto greedy vs IBR, verifica NE         |
-
+| ID | Name              | Description                                                                   |
+|----|-------------------|-------------------------------------------------------------------------------|
+| S1 | Baseline          | 10 tasks on 4 nodes at full utilization; measures nominal metrics             |
+| S2 | High Load         | 20 tasks on 4 nodes (overload); evaluates behavior under rejection            |
+| S3 | Node Failure      | Crash of edge-node-1 during execution; tests fault tolerance                  |
+| S4 | Network Partition | Network partition between nodes; verifies CRDT consistency after reconnection |
+| S5 | Nash Equilibrium  | 8 tasks with `NashTaskAgent`; greedy vs IBR comparison, NE verification       |
 
 ---
 
-## Metriche misurate
+## Measured Metrics
 
-- **Placement Latency (ms):** tempo totale di negoziazione CNP dalla CFP all'ACCEPT
-- **A2A Overhead (ms):** porzione del placement latency attribuibile alla comunicazione inter-agente
-- **SLA Violation Rate (%):** percentuale di task piazzate oltre il vincolo di latenza massima dichiarato
-- **CRDT Convergence Time (ms):** tempo per la convergenza completa del catalogo distribuito dopo un round di gossip
+- **Placement Latency (ms):** total CNP negotiation time from CFP to ACCEPT
+- **A2A Overhead (ms):** portion of placement latency attributable to inter-agent communication
+- **SLA Violation Rate (%):** percentage of placed tasks that exceed the declared maximum latency constraint
+- **CRDT Convergence Time (ms):** time for full convergence of the distributed catalogue after one gossip round
 
-Gli intervalli di confidenza sono calcolati con la distribuzione t di Student a 29 gradi di libertà (n=30 run, α=0.05): `IC = t(29, 0.975) × s/√30`.
+Confidence intervals are computed using the Student t-distribution with 29 degrees of freedom (n=30 runs, α=0.05): `CI = t(29, 0.975) × s/√30`.
