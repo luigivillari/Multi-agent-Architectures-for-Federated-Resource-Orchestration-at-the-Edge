@@ -13,12 +13,8 @@ distributed systems project/
 │   ├── crdt_catalogue.py      # CRDT: LWWRegister, NodeSnapshot, ResourceCatalogue
 │   ├── agents.py              # ResourceAgent, TaskAgent, NashTaskAgent (Ray Actors)
 │   ├── main.py                # Demo end-to-end (Fase 3 — simulazione base)
-│   └── phase4_experiments.py  # Esperimenti con 30 run e intervalli di confidenza
-├── results_CI_v4/             # Output degli esperimenti (grafici e raw_results.json)
-├── relazione.tex              # Relazione del progetto (LaTeX)
-├── state_of_the_art.tex       # Stato dell'arte (LaTeX)
-├── report.tex                 # Report sperimentale (LaTeX)
-├── refs.bib                   # Bibliografia
+│   └── experiments.py  # Esperimenti con 30 run
+├── results/             # Output degli esperimenti 
 └── README.md                  # Questo file
 ```
 
@@ -48,7 +44,7 @@ Implementa gli attori Ray del sistema:
 ### `main.py`
 Demo end-to-end della Fase 3. Avvia 4 nodi edge simulati, piazza 8 task con policy diverse e stampa le metriche di placement e lo stato del catalogo CRDT.
 
-### `phase4_experiments.py`
+### `experiments.py`
 Suite sperimentale completa (Fase 4). Esegue 30 run indipendenti per 5 scenari e produce grafici con intervalli di confidenza al 95%.
 
 ---
@@ -99,18 +95,18 @@ Esegue i 5 scenari sperimentali con 30 run ciascuno:
 
 ```bash
 cd src/
-python phase4_experiments.py
+python experiments.py
 ```
 
 Output:
-- `results_CI_v4/raw_results.json` — dati grezzi di tutti i run per ogni scenario
-- `results_CI_v4/plot_placement_latency.png` — latenza di placement media ± IC 95%
-- `results_CI_v4/plot_a2a_overhead.png` — overhead A2A medio ± IC 95%
-- `results_CI_v4/plot_sla_violations.png` — tasso di SLA violation ± IC 95%
-- `results_CI_v4/plot_crdt_convergence.png` — tempo di convergenza CRDT ± IC 95%
-- `results_CI_v4/plot_partition_divergence.png` — divergenza del catalogo durante partizione di rete (S4)
-- `results_CI_v4/plot_nash_convergence.png` — round di IBR per task e convergenza all'equilibrio di Nash (S5)
-- `results_CI_v4/summary_dashboard.png` — dashboard riepilogativa di tutti gli scenari
+- `results/raw_results.json` — dati grezzi di tutti i run per ogni scenario
+- `results/plot_placement_latency.png` — latenza di placement media ± IC 95%
+- `results/plot_a2a_overhead.png` — overhead A2A medio ± IC 95%
+- `results/plot_sla_violations.png` — tasso di SLA violation ± IC 95%
+- `results/plot_crdt_convergence.png` — tempo di convergenza CRDT ± IC 95%
+- `results/plot_partition_divergence.png` — divergenza del catalogo durante partizione di rete (S4)
+- `results/plot_nash_convergence.png` — round di IBR per task e convergenza all'equilibrio di Nash (S5)
+- `results/summary_dashboard.png` — dashboard riepilogativa di tutti gli scenari
 
 > **Tempo di esecuzione stimato:** circa 5–15 minuti su un laptop moderno, in base alle risorse disponibili per Ray.
 
@@ -126,27 +122,6 @@ Output:
 | S4 | Network Partition  | Partizione di rete tra i nodi; verifica della consistenza CRDT al ripristino |
 | S5 | Nash Equilibrium   | 8 task con `NashTaskAgent`; confronto greedy vs IBR, verifica NE         |
 
----
-
-## Architettura del sistema
-
-```
-TaskAgent (Ray Actor)
-    │
-    │  CFP (Contract Net Protocol)
-    ▼
-ResourceAgent × N (Ray Actor)
-    │  PROPOSE / REJECT / COUNTER_OFFER
-    └──────────────────────────────────►  TaskAgent
-                                              │
-                                         ACCEPT / INFORM
-                                              │
-                                         ResourceAgent (selezionato)
-                                              │
-                                    gossip CRDT ◄──► ResourceAgent × (N-1)
-```
-
-La comunicazione A2A è realizzata tramite il message-passing di Ray (`actor.method.remote()`), che emula un layer JSON-RPC 2.0 tra agenti isolati in processi separati. Il catalogo delle risorse è un G-Map CRDT replicato su tutti i nodi e sincronizzato via gossip alla fine di ogni round di negoziazione.
 
 ---
 
