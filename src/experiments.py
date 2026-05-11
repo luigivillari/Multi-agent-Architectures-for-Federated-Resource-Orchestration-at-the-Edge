@@ -1,8 +1,4 @@
 """
-phase4_experiments.py
-=====================
-Fase 4 — Experimentation & Evaluation
-
 Esegue 4 scenari sperimentali e misura le 4 metriche del progetto:
   1. Placement Latency       — tempo totale per piazzare un task (ms)
   2. A2A Protocol Overhead   — tempo della sola fase di negoziazione (ms)
@@ -34,7 +30,7 @@ import copy
 from typing import List, Dict, Any
 
 import matplotlib
-matplotlib.use("Agg")          # backend non-interattivo (funziona senza display)
+matplotlib.use("Agg")          
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import numpy as np
@@ -84,7 +80,6 @@ _actor_registry: list = []
 
 
 def make_resource_agents():
-    """Crea 4 ResourceAgent freschi e li registra nel registry globale."""
     agents = []
     for (node_id, cpu, mem, lat, energy) in EDGE_NODES:
         a = ResourceAgent.remote(node_id, cpu, mem, lat, energy)
@@ -100,14 +95,12 @@ def make_resource_agents():
 
 def kill_registered_actors():
     """
-    Distrugge tutti gli actor Ray registrati e svuota il registry.
-    Da chiamare alla fine di ogni run per liberare memoria.
     """
     for actor in _actor_registry:
         try:
             ray.kill(actor, no_restart=True)
         except Exception:
-            pass   # già morto (es. S3 node failure)
+            pass   
     _actor_registry.clear()
     # Piccola pausa per dare a Ray il tempo di liberare le risorse
     time.sleep(0.2)
@@ -115,20 +108,13 @@ def kill_registered_actors():
 
 def run_task_via_agent(task_id: str, cpu: float, mem: float, max_lat: float,
                        policy: PlacementPolicy, resource_agents: list) -> dict:
-    """
-    Crea un TaskAgent Ray Actor e lo usa per la negoziazione CNP.
-
-    Questa è la vera comunicazione A2A: il TaskAgent è un processo Ray
-    isolato che invia messaggi CFP agli ResourceAgent (anch'essi Actor)
-    e riceve le risposte tramite il message-passing di Ray.
-    """
     req = TaskRequirements(cpu_cores=cpu, memory_mb=mem,
                            max_latency_ms=max_lat, duration_sec=10,
                            priority=2, task_type="generic")
     agent = TaskAgent.remote(task_id, req, policy)
     _actor_registry.append(agent)
     result = ray.get(agent.place.remote(resource_agents))
-    # Rimuove dead_agent_indices dal result (non è una metrica da aggregare)
+    # Rimuove dead_agent_indices dal result 
     result.pop("dead_agent_indices", None)
     return result
 
@@ -196,11 +182,6 @@ def compute_metrics(task_results: list) -> dict:
 # ─────────────────────────────────────────────
 
 def ci_95(values: list) -> float:
-    """
-    Intervallo di confidenza al 95% per la media campionaria.
-    Usa la distribuzione t di Student (corretta per piccoli campioni).
-    Formula: CI = t_(0.975, df=n-1) * std(values) / sqrt(n)
-    """
     n = len(values)
     if n < 2:
         return 0.0
@@ -221,14 +202,6 @@ def ci_95(values: list) -> float:
 def run_scenario_n_times(scenario_fn, scenario_name: str,
                          n_runs: int = N_RUNS) -> dict:
     """
-    Esegue lo stesso scenario n_runs volte come run indipendenti.
-    Per ogni run raccoglie le 4 metriche scalari aggregate.
-    Alla fine calcola media e CI al 95% su quei campioni.
-
-    Perché questo riduce il CI:
-        CI = t * std / sqrt(n_runs)
-    Raddoppiare n_runs dimezza l'errore standard.
-
     Ritorna un dict compatibile con i plot esistenti, con in più:
         - *_ci   : intervallo di confidenza al 95%
         - *_runs : lista dei valori per run (per scatter plot)
@@ -258,8 +231,7 @@ def run_scenario_n_times(scenario_fn, scenario_name: str,
         finally:
             # ── CLEANUP CRITICO ───────────────────────────────────────────────
             # Distrugge tutti gli actor Ray creati in questa run (ResourceAgent,
-            # NashTaskAgent, ecc.). Senza questo, ogni run accumula ~4-16 processi
-            # Python in RAM fino a OOM. Chiamato sempre, anche in caso di errore.
+            # NashTaskAgent, ecc.)
             kill_registered_actors()
 
     if last_run is None:
@@ -288,7 +260,7 @@ def run_scenario_n_times(scenario_fn, scenario_name: str,
     result["crdt_convergence_ms_ci"]  = ci_95(crdt_runs)
     result["crdt_convergence_ms_runs"] = crdt_runs
 
-    result["n_runs"] = len(lat_runs)   # run effettive (escluse quelle con errore)
+    result["n_runs"] = len(lat_runs)  
 
     print(f"  ── {scenario_name}: {len(lat_runs)} run valide ──")
     print(f"     Placement latency : {result['placement_latency_ms']:.2f} ± "
@@ -427,13 +399,10 @@ def scenario_node_failure() -> dict:
     t_failure = time.time()
     ray.kill(agents[3], no_restart=True)   # nodo morto — nessun gossip preventivo
 
-    # I peer non sanno ancora che il nodo è morto.
-    # Mandiamo i CFP a tutti e 4, incluso il nodo morto.
     active_agents = list(agents)
     crash_detected = False
     t_detect = None
 
-    # Task post-failure randomizzati: misura resilienza sotto carichi diversi
     tasks_post = []
     for i in range(5):
         cpu = random.choice([0.5, 1.0, 2.0, 4.0])
@@ -719,11 +688,7 @@ def scenario_s5_nash() -> dict:
 
 
 def plot_runs_scatter(all_metrics: dict):
-    """
-    Scatter plot delle singole run per ogni scenario e metrica.
-    Permette di vedere la distribuzione dei campioni e giustificare
-    visivamente la larghezza degli intervalli di confidenza.
-    """
+
     metrics_info = [
         ("placement_latency_runs",   "placement_latency_ms",   "Placement Latency (ms)",     "placement_latency_ci"),
         ("a2a_overhead_runs",        "a2a_overhead_ms",        "A2A Overhead (ms)",           "a2a_overhead_ci"),
@@ -971,10 +936,6 @@ def plot_summary_dashboard(all_metrics: dict):
 
 
 def plot_partition_crdt_divergence(s4_metrics: dict):
-    """
-    Grafico specifico per S4: mostra la divergenza CRDT
-    prima e dopo la riconnessione.
-    """
     fig, ax = plt.subplots(figsize=(7, 4))
     labels = ["Durante la partizione", "Dopo il gossip"]
     vals   = [
@@ -1002,17 +963,6 @@ def plot_partition_crdt_divergence(s4_metrics: dict):
 
 
 def plot_nash_convergence(s5_metrics: dict):
-    """
-    Due subplot:
-      (a) Rounds to Nash Equilibrium per task
-          Verde  = NE al round 1 (nessun rilassamento necessario)
-          Giallo = NE al round 2
-          Rosso  = NE al round 3+
-          Viola  = fallback (max_rounds esaurito, nessun NE formale)
-          Grigio = task fallito (0 proposte in tutti i round)
-      (b) Confronto Greedy vs Nash IBR su 3 indicatori:
-          task piazzati, fallimenti, violazioni SLA (requisiti originali)
-    """
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
     fig.suptitle("S5 — Nash Equilibrium: Greedy vs. Iterative Best Response",
                  fontsize=14, fontweight="bold")
@@ -1136,10 +1086,6 @@ def main():
 
     all_metrics: Dict[str, Any] = {}
 
-    # ── Ogni scenario viene eseguito N_RUNS volte. ───────────────
-    # Le metriche scalari di ciascuna run sono campioni i.i.d.
-    # Il CI al 95% si restringe come 1/sqrt(N_RUNS).
-    # ─────────────────────────────────────────────────────────────
     sep("─")
     print("SCENARIO 1 — Baseline"); sep("─")
     all_metrics["S1 Baseline"] = run_scenario_n_times(

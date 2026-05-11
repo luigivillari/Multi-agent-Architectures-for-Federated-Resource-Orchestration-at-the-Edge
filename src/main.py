@@ -1,22 +1,3 @@
-"""
-main.py
-=======
-Fase 3 — Simulazione End-to-End del Sistema di Negoziazione
-
-Avvia un cluster Ray locale simulando 4 nodi edge con caratteristiche diverse.
-Poi piazza 8 task con policy diverse e mostra le metriche di placement.
-
-Esecuzione:
-    cd src/
-    python main.py
-
-Output atteso:
-    - Log delle negoziazioni in tempo reale
-    - Tabella riepilogativa dei placement
-    - Metriche: latenza A2A, SLA violation rate, distribuzione carico
-    - Stato del catalogo CRDT dopo la sincronizzazione gossip
-"""
-
 import ray
 import time
 import json
@@ -86,7 +67,6 @@ def simulate_crdt_gossip(resource_agents: List[ray.actor.ActorHandle]):
 def measure_catalogue_convergence(resource_agents: List[ray.actor.ActorHandle]) -> float:
     """
     Misura la convergenza CRDT: quante entry divergono tra i cataloghi dei nodi.
-    Ritorna percentuale di convergenza (100% = tutti i nodi allineati).
     """
     catalogues = [ray.get(a.get_catalogue_object.remote()) for a in resource_agents]
     total_diffs = 0
@@ -106,7 +86,6 @@ def measure_catalogue_convergence(resource_agents: List[ray.actor.ActorHandle]) 
 
 
 def print_results_table(results: List[dict]):
-    """Stampa una tabella formattata con i risultati del placement."""
     print_section("RISULTATI PLACEMENT")
     header = f"{'Task':<12} {'Stato':<10} {'Nodo':<14} {'Policy':<16} {'Score':<8} {'A2A(ms)':<10} {'Lat(ms)':<10}"
     print(header)
@@ -151,7 +130,6 @@ def print_results_table(results: List[dict]):
 
 
 def print_node_states(resource_agents: List[ray.actor.ActorHandle]):
-    """Stampa lo stato corrente di tutti i nodi edge."""
     print_section("STATO NODI EDGE (dopo placement)")
     header = f"{'Nodo':<14} {'CPU avail':<12} {'MEM avail':<12} {'Task attivi':<13} {'Lat(ms)':<10}"
     print(header)
@@ -169,12 +147,12 @@ def print_node_states(resource_agents: List[ray.actor.ActorHandle]):
 
 
 def main():
-    # ── Avvio Ray ──────────────────────────────
+    #  Avvio Ray 
     print_section("AVVIO SISTEMA — Agentic Edge Orchestration")
     ray.init(ignore_reinit_error=True)
     print(f"Ray avviato. Risorse cluster: {ray.cluster_resources()}")
 
-    # ── Crea ResourceAgent (uno per nodo) ──────
+    #  Crea ResourceAgent 
     print_section("FASE 2 — Inizializzazione Resource Agents")
     resource_agents = []
     for (node_id, cpu, mem, lat, energy) in EDGE_NODES:
@@ -182,21 +160,21 @@ def main():
         resource_agents.append(agent)
         print(f"  Creato ResourceAgent: {node_id}")
 
-    # Registra i peer (per gossip CRDT)
+    # Registra i peer 
     for i, agent in enumerate(resource_agents):
         peers = [a for j, a in enumerate(resource_agents) if j != i]
         agent.register_peers.remote(peers)
 
     time.sleep(0.2)  # attendi inizializzazione
 
-    # ── Mostra catalogo CRDT iniziale ──────────
+    # Mostra catalogo CRDT iniziale 
     print_section("FASE 2 — Resource Catalogue CRDT (stato iniziale)")
     for agent in resource_agents:
         snap = ray.get(agent.get_catalogue_snapshot.remote())
         print(f"  {snap['owner']}: clock={snap['lamport_clock']}, "
               f"nodi nel catalogo={len(snap['nodes'])}")
 
-    # ── Esegui placement dei task ───────────────
+    # Esegui placement dei task 
     print_section("FASE 3 — Negoziazione A2A: Placement dei Task")
     all_results = []
 
@@ -217,10 +195,9 @@ def main():
         result = ray.get(task_agent.place.remote(resource_agents))
         all_results.append(result)
 
-        # Piccola pausa tra i task per simulare arrivo temporizzato
         time.sleep(0.05)
 
-    # ── CRDT Gossip Sync ──────────────────────
+    #  CRDT Gossip Sync 
     print_section("FASE 3 — CRDT Gossip Synchronization")
     t_gossip_start = time.time()
     simulate_crdt_gossip(resource_agents)
@@ -230,11 +207,9 @@ def main():
     print(f"  Convergenza catalogo CRDT: {convergence:.1f}%")
     print(f"  Gossip round completato in: {(t_gossip_end-t_gossip_start)*1000:.1f}ms")
 
-    # ── Stampa risultati ──────────────────────
     print_results_table(all_results)
     print_node_states(resource_agents)
 
-    # ── Salva risultati JSON (per Fase 4) ──────
     import os
     out_dir = os.path.dirname(os.path.abspath(__file__))
     results_path = os.path.join(out_dir, "results.json")

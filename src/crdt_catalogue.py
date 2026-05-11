@@ -1,11 +1,5 @@
 """
-crdt_catalogue.py
-=================
-Fase 2 — Data Model: CRDT Resource Catalogue
-
 Implementa il catalogo delle risorse edge usando strutture CRDT.
-Nessun coordinatore centrale: ogni nodo mantiene la propria copia
-e le merge sono sempre prive di conflitti (matematicamente garantito).
 
 Struttura:
     ResourceCatalogue  →  G-Map { node_id → NodeSnapshot }
@@ -35,11 +29,6 @@ class LWWRegister:
     """
     Un registro CRDT che risolve i conflitti tenendo il valore
     con il timestamp di Lamport più alto (Last Write Wins).
-
-    Perché Lamport clock e non wall clock?
-    I wall clock (time.time()) non sono sincronizzati tra nodi edge distanti.
-    Il Lamport clock è logico: ogni nodo incrementa il proprio contatore
-    ad ogni evento, garantendo un ordinamento parziale corretto.
     """
     value: any          # valore corrente
     timestamp: int      # Lamport clock al momento della scrittura
@@ -48,8 +37,7 @@ class LWWRegister:
     def update(self, new_value, new_ts: int, writer_node: str) -> bool:
         """
         Aggiorna il registro se il nuovo timestamp è maggiore.
-        In caso di parità, vince il node_id lessicograficamente maggiore (tie-breaking deterministico).
-        Ritorna True se l'update ha avuto effetto.
+        In caso di parità, vince il node_id lessicograficamente maggiore
         """
         if new_ts > self.timestamp:
             self.value = new_value
@@ -83,12 +71,10 @@ class NodeSnapshot:
     """
     Rappresenta lo stato corrente di un nodo edge.
     Ogni campo è un LWW-Register → aggiornabile in modo CRDT-safe.
-
-    Questo è il "valore" nella G-Map del ResourceCatalogue.
     """
     node_id: str
 
-    # Risorse disponibili (aggiornate dopo ogni allocation/release)
+    # Risorse disponibili 
     cpu_available:    LWWRegister = field(default=None)  # core disponibili
     memory_mb:        LWWRegister = field(default=None)  # MB disponibili
     latency_ms:       LWWRegister = field(default=None)  # latenza stimata verso cloud (ms)
@@ -159,12 +145,6 @@ class ResourceCatalogue:
 
     Ogni ResourceAgent mantiene un'istanza locale di ResourceCatalogue e
     la sincronizza periodicamente con i nodi vicini tramite gossip protocol.
-
-    Lamport Clock:
-        Ogni operazione di scrittura locale incrementa il clock logico.
-        Durante il merge, il clock locale viene aggiornato al massimo tra
-        i due clock (garantisce che eventi successivi al merge abbiano
-        timestamp più alti di tutti gli eventi mergiati).
     """
 
     def __init__(self, owner_node_id: str):
@@ -174,7 +154,7 @@ class ResourceCatalogue:
         self._version_vector: Dict[str, int] = {owner_node_id: 0}
         self._merge_history: List[Tuple[str, float]] = []  # (merged_from, timestamp)
 
-    # ── Lamport Clock ─────────────────────────
+    # Lamport Clock 
 
     def _tick(self) -> int:
         """Incrementa e ritorna il Lamport clock locale."""
@@ -187,7 +167,7 @@ class ResourceCatalogue:
         self._lamport_clock = max(self._lamport_clock, received_ts) + 1
         self._version_vector[self.owner_node_id] = self._lamport_clock
 
-    # ── Operazioni Locali ─────────────────────
+    # Operazioni Locali 
 
     def upsert_node(self, node_id: str,
                     cpu: float, memory_mb: float,
@@ -230,16 +210,12 @@ class ResourceCatalogue:
             ts = self._tick()
             self._entries[node_id].is_online.update(False, ts, self.owner_node_id)
 
-    # ── CRDT Merge ────────────────────────────
+    # CRDT Merge 
 
     def merge(self, remote_catalogue: ResourceCatalogue):
         """
         Merge CRDT con il catalogo di un altro nodo.
         Operazione commutativa, associativa e idempotente.
-        Può essere chiamata in qualsiasi ordine con qualsiasi nodo.
-
-        Questo è il cuore del consistency layer:
-        dopo il merge, entrambi i nodi convergono allo stesso stato.
         """
         remote_max_ts = max(remote_catalogue._version_vector.values(), default=0)
         self._update_clock(remote_max_ts)
@@ -274,7 +250,6 @@ class ResourceCatalogue:
     def convergence_diff(self, other: ResourceCatalogue) -> List[str]:
         """
         Ritorna i node_id per cui i due cataloghi divergono ancora.
-        Usato nella Fase 4 per misurare il CRDT convergence time.
         """
         diffs = []
         all_ids = set(self._entries) | set(other._entries)

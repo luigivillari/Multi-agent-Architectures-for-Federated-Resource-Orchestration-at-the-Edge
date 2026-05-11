@@ -1,8 +1,4 @@
 """
-protocol.py
-===========
-Fase 2 — A2A Protocol: Grammatica dei Messaggi di Negoziazione
-
 Definisce tutti i tipi di messaggio scambiati tra ResourceAgent e TaskAgent.
 
 Flusso di negoziazione:
@@ -45,13 +41,12 @@ class MessageType(str, Enum):
 class TaskRequirements:
     """
     Requisiti di un task — payload del messaggio CFP.
-    Il TaskAgent descrive cosa gli serve, il ResourceAgent valuta se può soddisfarlo.
     """
-    cpu_cores: float          # es. 2.0 (numero di core richiesti)
-    memory_mb: float          # es. 512.0 (MB di RAM richiesti)
-    max_latency_ms: float     # es. 100.0 (latenza massima accettabile in ms)
-    duration_sec: float       # es. 30.0 (durata stimata del task)
-    priority: int = 1         # 1=bassa, 2=media, 3=alta
+    cpu_cores: float          
+    memory_mb: float          
+    max_latency_ms: float     
+    duration_sec: float      
+    priority: int = 1         
     task_type: str = "generic" # "inference", "streaming", "batch", "generic"
 
     def to_dict(self) -> Dict[str, Any]:
@@ -68,7 +63,7 @@ class ResourceOffer:
     available_cpu: float      # CPU effettivamente disponibile
     available_memory_mb: float
     estimated_latency_ms: float
-    energy_cost_score: float  # 0.0 (efficiente) → 1.0 (costoso)
+    energy_cost_score: float  
     score: float = 0.0        # score calcolato dalla policy (più alto = migliore)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -84,7 +79,7 @@ class A2AMessage:
     """
     msg_type:     MessageType
     sender_id:    str                      # ID dell'agente mittente
-    receiver_id:  str                      # ID dell'agente destinatario ("*" = broadcast)
+    receiver_id:  str                      # ID dell'agente destinatario
     conversation_id: str                   # UUID della conversazione di negoziazione
     timestamp:    float = field(default_factory=time.time)
     msg_id:       str   = field(default_factory=lambda: str(uuid.uuid4())[:8])
@@ -93,7 +88,7 @@ class A2AMessage:
     task_id:      Optional[str] = None
     requirements: Optional[TaskRequirements] = None
     offer:        Optional[ResourceOffer] = None
-    reason:       Optional[str] = None     # per REJECT: motivo del rifiuto
+    reason:       Optional[str] = None     # motivo del rifiuto
     metadata:     Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -127,7 +122,7 @@ class A2AMessage:
 
 def make_cfp(sender_id: str, task_id: str, requirements: TaskRequirements,
              receivers: str = "*") -> A2AMessage:
-    """Crea un Call for Proposals (broadcast del TaskAgent)."""
+    """Crea un Call for Proposals"""
     return A2AMessage(
         msg_type=MessageType.CFP,
         sender_id=sender_id,
@@ -139,7 +134,7 @@ def make_cfp(sender_id: str, task_id: str, requirements: TaskRequirements,
 
 def make_propose(sender_id: str, receiver_id: str, task_id: str,
                  conv_id: str, offer: ResourceOffer) -> A2AMessage:
-    """Crea una PROPOSE (risposta del ResourceAgent alla CFP)."""
+    """Crea una PROPOSE"""
     return A2AMessage(
         msg_type=MessageType.PROPOSE,
         sender_id=sender_id,
@@ -151,7 +146,7 @@ def make_propose(sender_id: str, receiver_id: str, task_id: str,
 
 def make_accept(sender_id: str, receiver_id: str,
                 task_id: str, conv_id: str) -> A2AMessage:
-    """Crea un ACCEPT (TaskAgent accetta l'offerta del ResourceAgent vincitore)."""
+    """Crea un ACCEPT"""
     return A2AMessage(
         msg_type=MessageType.ACCEPT,
         sender_id=sender_id,
@@ -174,7 +169,7 @@ def make_reject(sender_id: str, receiver_id: str,
 
 def make_counter_offer(sender_id: str, receiver_id: str, task_id: str,
                        conv_id: str, offer: ResourceOffer) -> A2AMessage:
-    """Crea una COUNTER_OFFER (ResourceAgent propone termini diversi)."""
+    """Crea una COUNTER_OFFER"""
     return A2AMessage(
         msg_type=MessageType.COUNTER_OFFER,
         sender_id=sender_id,
@@ -186,7 +181,7 @@ def make_counter_offer(sender_id: str, receiver_id: str, task_id: str,
 
 def make_inform_done(sender_id: str, receiver_id: str,
                      task_id: str, conv_id: str) -> A2AMessage:
-    """Crea un INFORM_DONE (ResourceAgent notifica completamento task)."""
+    """Crea un INFORM_DONE"""
     return A2AMessage(
         msg_type=MessageType.INFORM_DONE,
         sender_id=sender_id,
@@ -209,8 +204,6 @@ def score_offer(offer: ResourceOffer, policy: PlacementPolicy) -> float:
     """
     Calcola uno score per un'offerta dato una policy.
     Score più alto = offerta migliore.
-
-    Usato dal TaskAgent per confrontare le proposte ricevute.
     """
     # Normalizza latency: 0ms → 1.0, 500ms → 0.0
     latency_score = max(0.0, 1.0 - offer.estimated_latency_ms / 500.0)

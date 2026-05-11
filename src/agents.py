@@ -1,9 +1,3 @@
-"""
-agents.py
-=========
-Fase 2 — Agent Modelling: ResourceAgent e TaskAgent come Ray Actors
-"""
-
 import ray
 import time
 import random
@@ -17,9 +11,7 @@ from protocol import (
 from crdt_catalogue import ResourceCatalogue
 
 
-# ═══════════════════════════════════════════════════════════
-#  RESOURCE AGENT
-# ═══════════════════════════════════════════════════════════
+
 
 @ray.remote
 class ResourceAgent:
@@ -169,7 +161,7 @@ class ResourceAgent:
     def mark_node_offline_external(self, node_id: str):
         """
         Un nodo sopravvissuto marca un altro nodo come offline nel proprio
-        catalogo CRDT locale (usato dopo rilevamento crash via RayActorError).
+        catalogo CRDT locale.
         """
         self.catalogue.mark_offline(node_id)
         print(f"[{self.node_id}] CRDT aggiornato: {node_id} marcato OFFLINE (crash rilevato)")
@@ -204,10 +196,6 @@ class ResourceAgent:
         return self.negotiation_log
 
 
-# ═══════════════════════════════════════════════════════════
-#  TASK AGENT
-# ═══════════════════════════════════════════════════════════
-
 @ray.remote
 class TaskAgent:
     def __init__(self, task_id: str, requirements: TaskRequirements,
@@ -230,17 +218,6 @@ class TaskAgent:
     def place(self, resource_agents: list) -> dict:
         """
         Negoziazione CNP completa via comunicazione A2A tra Actor Ray.
-
-        Questa è la vera interazione Agent-to-Agent: il TaskAgent (Actor)
-        invia messaggi CFP agli ResourceAgent (Actor) e riceve le risposte
-        attraverso il message-passing di Ray, esattamente come avverrebbe
-        su una rete reale tra nodi distribuiti.
-
-        Aggiunto rispetto alla versione originale:
-          - Misura separata di a2a_overhead_ms (broadcast CFP → raccolta risposte)
-          - Gestione RayActorError per fault tolerance (scenario S3 node failure)
-          - dead_agent_indices: indici dei nodi che non hanno risposto (per CRDT update)
-          - sla_ok e max_latency_ms nel risultato (per metriche di valutazione)
         """
         from protocol import make_cfp
         t_start = time.time()
@@ -251,13 +228,6 @@ class TaskAgent:
                                 "n_agents": len(resource_agents)})
         print(f"[TaskAgent:{self.task_id}] -> CFP inviata a {len(resource_agents)} nodi")
 
-        # ── Mapping node_id → actor costruito UNA SOLA VOLTA prima della fase CFP ──
-        # Se fatto dopo (come in get_state post-A2A), aggiunge un ray.get() su tutti
-        # i nodi FUORI da a2a_overhead_ms ma DENTRO placement_latency_ms,
-        # introducendo varianza artificiale nei CI. Qui invece è parte del setup
-        # costante, prima di t_cfp, e non inquina la misurazione di placement_latency.
-        # Gestione fault-tolerant: se un nodo è già morto (S3 post-failure),
-        # l'ActorDiedError viene ignorato — l'agente sarà escluso anche durante i CFP.
         node_id_to_agent = {}
         for _a in resource_agents:
             try:
@@ -267,9 +237,7 @@ class TaskAgent:
                     ray.exceptions.ActorDiedError):
                 pass  # nodo già morto — sarà rilevato come dead_agent durante CFP
 
-        # ── A2A overhead: tempo dal broadcast CFP alla raccolta di tutte le risposte ──
-        # Raccoglie individualmente per gestire crash di singoli nodi (RayActorError)
-        # senza abortire l'intera negoziazione.
+  
         t_cfp = time.time()
         refs = [agent.receive_cfp.remote(cfp) for agent in resource_agents]
         responses = []
@@ -285,7 +253,7 @@ class TaskAgent:
         t_responses = time.time()
         a2a_overhead_ms = (t_responses - t_cfp) * 1000
 
-        # ── Scoring delle proposte ricevute ──────────────────────────────────────
+        #  Scoring delle proposte ricevute 
         proposals = []
         for resp in responses:
             if resp is None:
@@ -320,16 +288,13 @@ class TaskAgent:
             print(f"[TaskAgent:{self.task_id}] x Nessuna proposta ricevuta.")
             return result
 
-        # ── Best response: seleziona l'offerta con score massimo ─────────────────
+        # Best response: seleziona l'offerta con score massimo
         best   = max(proposals, key=lambda r: r.offer.score)
         losers = [r for r in proposals if r.sender_id != best.sender_id]
         print(f"[TaskAgent:{self.task_id}] -> Vincitore: {best.sender_id} "
               f"(score={best.offer.score:.3f})")
 
-        # ── ACCEPT / REJECT usando il mapping pre-costruito ─────────────────────
-        # Nessun ray.get([get_state.remote()]) post-A2A: il mapping node_id_to_agent
-        # è già disponibile. Questo elimina la principale fonte di varianza in
-        # placement_latency_ms che non era presente in a2a_overhead_ms.
+        # ACCEPT / REJECT usando il mapping pre-costruito
         accept_msg = make_accept(f"task-{self.task_id}", best.sender_id,
                                  self.task_id, cfp.conversation_id)
         ray.get(node_id_to_agent[best.sender_id].receive_accept.remote(accept_msg))
@@ -378,10 +343,6 @@ class TaskAgent:
         }
 
 
-# ═══════════════════════════════════════════════════════════
-#  NASH TASK AGENT — Iterative Best Response
-# ═══════════════════════════════════════════════════════════
-
 @ray.remote
 class NashTaskAgent:
     """
@@ -402,11 +363,6 @@ class NashTaskAgent:
       C3 - Stabilita' SLA            : latenza stimata <= max_latency_ms corrente
       C4 - Meccanismo veritiero      : dichiarazione onesta e' dominant strategy
                                        (proprieta' strutturale - sempre True by design)
-
-    Se il NE non e' raggiunto, i requisiti vengono rilassati progressivamente
-    (max_latency_ms * (1 + relaxation_factor * round),
-     CPU e MEM con floor al 70% del valore originale)
-    fino a max_rounds iterazioni, poi fallback al miglior risultato disponibile.
     """
 
     def __init__(self, task_id: str, requirements: TaskRequirements,
@@ -430,15 +386,10 @@ class NashTaskAgent:
         print(f"[NashAgent:{task_id}] Creato. Policy={policy.value}, "
               f"max_rounds={max_rounds}, relaxation={relaxation_factor:.0%}")
 
-    # ── Utilita' e verifica Nash ─────────────────────────────────────────────
+    # Utilita' e verifica Nash 
 
     def _compute_agent_utility(self, offer: ResourceOffer,
                                 req: TaskRequirements) -> float:
-        """
-        Utilita' del ResourceAgent per questo task.
-        Media normalizzata di CPU ratio, MEM ratio e latency ratio.
-        Valore in [0, 1]: 1 = risorse abbondanti e latenza perfetta.
-        """
         cpu_ratio = min(1.0, offer.available_cpu / max(req.cpu_cores, 0.01))
         mem_ratio = min(1.0, offer.available_memory_mb / max(req.memory_mb, 0.01))
         lat_ratio = max(0.0, 1.0 - offer.estimated_latency_ms
@@ -483,12 +434,7 @@ class NashTaskAgent:
 
     def _relax_requirements(self, req: TaskRequirements,
                              round_num: int) -> TaskRequirements:
-        """
-        Rilassa i requisiti per il round successivo.
-          - max_latency_ms : aumenta del relaxation_factor * (round+1)
-          - cpu_cores      : riduzione lieve, floor al 70% dell'originale
-          - memory_mb      : riduzione lieve, floor al 70% dell'originale
-        """
+    
         factor  = 1.0 + self.relaxation_factor * (round_num + 1)
         new_lat = req.max_latency_ms * factor
 
@@ -506,7 +452,7 @@ class NashTaskAgent:
             task_type      = req.task_type,
         )
 
-    # ── Placement multi-round ────────────────────────────────────────────────
+    #  Placement multi-round 
 
     def place_nash(self, resource_agents: list) -> dict:
         """
@@ -526,7 +472,7 @@ class NashTaskAgent:
         t_start = time.time()
         self.status = "negotiating"
 
-        # Copia locale dei requisiti (non altera self.requirements)
+        # Copia locale dei requisiti  
         current_req = TaskRequirements(
             cpu_cores      = self.requirements.cpu_cores,
             memory_mb      = self.requirements.memory_mb,
@@ -586,7 +532,7 @@ class NashTaskAgent:
                 current_req = self._relax_requirements(current_req, round_num)
                 continue
 
-            # 3. Best response del TaskAgent: seleziona score massimo
+            # 3. Best response del TaskAgent: 
             best = max(proposals, key=lambda r: r.offer.score)
 
             # Aggiorna il fallback con il miglior risultato visto finora
